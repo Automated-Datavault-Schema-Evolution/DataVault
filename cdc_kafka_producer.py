@@ -1,0 +1,172 @@
+import os
+import json
+import time
+import pandas as pd
+import psycopg2
+from psycopg2 import sql
+from kafka import KafkaProducer
+from kafka.admin import KafkaAdminClient, NewTopic
+from kafka.errors import TopicAlreadyExistsError
+
+from config import (
+    LAKE_TYPE, PARQUET_PATH,
+    RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER, RDBMS_PASSWORD, RDBMS_SCHEMA,
+    KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC,
+)
+
+from logger import log
+WATERMARK_FILE = "cdc_watermarks.json"
+
+# --- Kafka topic management ---
+def check_and_create_topic(
+    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+    topic_name=KAFKA_TOPIC,
+    num_partitions=1,
+    replication_factor=1,
+    timeout_sec=30
+):
+    """
+    Ensures a Kafka topic exists and waits until at least one partition is available.
+    """
+    admin = KafkaAdminClient(bootstrap_servers=bootstrap_servers)
+    topics = admin.list_topics()
+    if topic_name in topics:
+        log.debug(f"[Kafka] Topic '{topic_name}' already exists.")
+    else:
+        log.warning(f"[Kafka] Topic '{topic_name}' does not exist. Creating...")
+        topic = NewTopic(name=topic_name, num_partitions=num_partitions, replication_factor=replication_factor)
+        try:
+            admin.create_topics([topic])
+            log.info(f"[Kafka] Topic '{topic_name}' created.")
+        except TopicAlreadyExistsError:
+            log.error(f"[Kafka] Topic '{topic_name}' already created by another process.")
+    admin.close()
+
+    # Wait until at least one partition is assigned to the topic
+    start = time.time()
+    while True:
+        try:
+            producer = KafkaProducer(bootstrap_servers=bootstrap_servers)
+            partitions = producer.partitions_for(topic_name)
+            producer.close()
+            if partitions and len(partitions) > 0:
+                log.debug(f"[Kafka] Topic '{topic_name}' is available with {len(partitions)} partition(s).")
+                break
+            else:
+                log.debug(f"[Kafka] Waiting for partitions for topic '{topic_name}'...")
+        except Exception as e:
+            log.error(f"[Kafka] Waiting for topic '{topic_name}'... ({e})")
+        time.sleep(1)
+        if time.time() - start > timeout_sec:
+            raise TimeoutError(f"[Kafka] Timeout: Topic '{topic_name}' does not have partitions after {timeout_sec} seconds.")
+
+# Parquet helpers
+def get_parquet_tables():
+    return [f[:-8] for f in os.listdir(PARQUET_PATH) if f.endswith(".parquet")]
+
+def load_parquet_table(table_name):
+    return pd.read_parquet(os.path.join(PARQUET_PATH, table_name + ".parquet"))
+
+# RDBMS helpers
+def get_rdbms_tables():
+    conn = psycopg2.connect(
+        host=RDBMS_HOST, port=RDBMS_PORT,
+        dbname=RDBMS_DB, user=RDBMS_USER, password=RDBMS_PASSWORD
+    )
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = %s AND table_type = %s",
+        (RDBMS_SCHEMA, "BASE TABLE")
+    )
+    tables = [row[0] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return tables
+
+def load_rdbms_table(table_name):
+    conn = psycopg2.connect(
+        host=RDBMS_HOST, port=RDBMS_PORT,
+        dbname=RDBMS_DB, user=RDBMS_USER, password=RDBMS_PASSWORD
+    )
+    cur = conn.cursor()
+    # Use psycopg2.sql.Identifier for schema and table names (no static SQL)
+    query = sql.SQL("SELECT * FROM {}.{}").format(
+        sql.Identifier(RDBMS_SCHEMA),
+        sql.Identifier(table_name)
+    )
+    cur.execute(query)
+    data = cur.fetchall()
+    colnames = [desc[0] for desc in cur.description]
+    cur.close()
+    conn.close()
+    df = pd.DataFrame(data, columns=colnames)
+    return df
+
+def load_watermarks():
+    if os.path.exists(WATERMARK_FILE):
+        with open(WATERMARK_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_watermarks(wm):
+    with open(WATERMARK_FILE, "w") as f:
+        json.dump(wm, f)
+
+def cdc_producer_insert_only():
+    # Ensure topic exists and is ready
+    check_and_create_topic()
+
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        linger_ms=100,
+        acks='all'
+    )
+    log.info(f"[CDC Producer] Insert-only CDC from {LAKE_TYPE.upper()} staging area")
+    watermarks = load_watermarks()
+    while True:
+        if LAKE_TYPE == "parquet":
+            tables = get_parquet_tables()
+            load_func = load_parquet_table
+        elif LAKE_TYPE == "rdbms":
+            tables = get_rdbms_tables()
+            load_func = load_rdbms_table
+        else:
+            raise ValueError("Unknown LAKE_TYPE (must be 'parquet' or 'rdbms')")
+        for table in tables:
+            log.info(f"[CDC Producer] Scanning {table}")
+            try:
+                df = load_func(table)
+            except Exception as e:
+                log.info(f"Error loading {table}: {e}")
+                continue
+            if "modified_at" not in df.columns:
+                log.warning(f"Table {table} skipped: no 'modified_at' column for CDC.")
+                continue
+            last_ts = watermarks.get(table)
+            if last_ts is not None:
+                new_rows = df[df["modified_at"] > last_ts]
+            else:
+                new_rows = df
+            if new_rows.empty:
+                continue
+            for _, row in new_rows.iterrows():
+                payload = row.dropna().to_dict()
+                producer.send(
+                    KAFKA_TOPIC,
+                    {
+                        "table": table,
+                        "payload": json.dumps(payload, default=str),
+                        "cdc_type": "insert",
+                        "modified_at": payload["modified_at"]
+                    }
+                )
+            max_ts = new_rows["modified_at"].max()
+            watermarks[table] = max_ts
+            log.info(f"[CDC Producer] Produced {len(new_rows)} events for {table}. Watermark: {max_ts}")
+        producer.flush()
+        save_watermarks(watermarks)
+        time.sleep(5)
+
+if __name__ == "__main__":
+    cdc_producer_insert_only()
