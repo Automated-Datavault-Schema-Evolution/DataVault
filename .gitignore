@@ -2,8 +2,7 @@
 .idea
 *.csv
 .venv
-*.env
-.env.docker
+*.env.*
 /artifacts
 /models
 *.json
