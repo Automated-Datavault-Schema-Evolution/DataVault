@@ -54,3 +54,7 @@ METADATA_LINEAGE_PATH = os.getenv("METADATA_LINEAGE_PATH", "meta/lineage.parquet
 PROCESSING_MODE = os.getenv("PROCESSING_MODE", "streaming")
 
 DBT_PROFILES_DIR = os.path.join(os.path.dirname(__file__), "profiles")
+DBT_MODELS_JSON_DIR = os.path.join(os.path.dirname(__file__), "models", "json")
+# Thift Connection
+THRIFT_HOST = os.getenv("THRIFT_HOST", "localhost")
+THRIFT_PORT = int(os.getenv("THRIFT_PORT", "10000"))
