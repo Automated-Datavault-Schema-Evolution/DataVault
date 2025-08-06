@@ -1,0 +1,12 @@
+# Insert your dbt profile config here
+default:
+  target: dev
+  outputs:
+    dev:
+      type: spark
+      method: thrift
+      schema: default
+      host: host.docker.internal
+      port: 7079
+      user: dbt
+      threads: 3
