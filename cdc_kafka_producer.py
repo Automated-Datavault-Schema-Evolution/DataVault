@@ -150,6 +150,7 @@ def cdc_producer_insert_only():
                 new_rows = df
             if new_rows.empty:
                 continue
+            new_rows = new_rows.dropna(subset=["modified_at"])
             for _, row in new_rows.iterrows():
                 payload = row.dropna().to_dict()
                 producer.send(

@@ -51,6 +51,7 @@ DOCKER_NETWORK = os.getenv("DOCKER_NETWORK", "data_automation-net")
 
 METADATA_LINEAGE_TYPE = os.getenv("METADATA_LINEAGE_TYPE", "parquet")
 METADATA_LINEAGE_PATH = os.getenv("METADATA_LINEAGE_PATH", "meta/lineage.parquet")
+METADATA_METADATA_PATH = os.getenv("METADATA_METADATA_PATH", "meta/metadata.parquet")
 PROCESSING_MODE = os.getenv("PROCESSING_MODE", "streaming")
 
 DBT_PROFILES_DIR = os.path.join(os.path.dirname(__file__), "profiles")

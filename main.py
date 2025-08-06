@@ -8,37 +8,33 @@ from cdc_kafka_producer import cdc_producer_insert_only
 from config import (
     LAKE_TYPE, PARQUET_PATH,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
-    RDBMS_PASSWORD, RDBMS_SCHEMA,
+    RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR,
 )
-from dv_modeller import extract_metadata, get_model_type, get_builder_code, split_datavault
-from meta_store import write_lineage
+from dv_modeller import extract_metadata, split_datavault
+from meta_store import write_lineage, write_metadata
 from utils import get_spark_session
 from logger import log
 
-DBT_MODELS_PYTHON_DIR = os.path.join(os.path.dirname(__file__), "models", "python")
+# Directory where JSON model descriptions will be written
+# (configured via DBT_MODELS_JSON_DIR in config.py)
 WATERMARK_FILE = "cdc_watermarks.json"
 
-def indent_code(code, num_spaces=4):
-    pad = ' ' * num_spaces
-    return "\n".join(pad+line if line.strip() else "" for line in code.split("\n"))
-
-def write_python_model_file(model_name, builder_code, table_name, model_type, meta):
-    os.makedirs(DBT_MODELS_PYTHON_DIR, exist_ok=True)
-    file_path = os.path.join(DBT_MODELS_PYTHON_DIR, f"{model_name}.py")
-    with open("model_template.py.tpl", "r") as tpl:
-        template = tpl.read()
-
-    # builder_code = indent_code(builder_code)
-    code = template.format(
-        model_type=model_type,
-        table_name=table_name,
-        builder_code=builder_code,
-        model_name=model_name,
-        business_keys=json.dumps(list(meta['business_keys'])),
-    )
+def write_json_model_file(model_name, table_name, model_type, meta):
+    """Persist model metadata as JSON for dbt-spark."""
+    os.makedirs(DBT_MODELS_JSON_DIR, exist_ok=True)
+    file_path = os.path.join(DBT_MODELS_JSON_DIR, f"{model_name}.json")
+    model_def = {
+        "model_name": model_name,
+        "table_name": table_name,
+        "model_type": model_type,
+        "business_keys": meta.get("business_keys", []),
+        "attributes": meta.get("attributes", []),
+        "columns": meta.get("columns", []),
+    }
     with open(file_path, "w") as file:
-        file.write(code)
-    log.info(f"[GEN] Generated DBT model for {model_name} (from lake table {table_name})")
+        json.dump(model_def, file, indent=2)
+    write_metadata(model_def)
+    log.info(f"[GEN] Generated DBT JSON model for {model_name} (from lake table {table_name})")
 
 def generate_schema_yml(table_names, output_path="models/schema.yml"):
     lines = []
@@ -75,6 +71,7 @@ def ensure_dbt_models_for_lake():
         log.debug(f"lake tables: {lake_tables}")
         cur.close()
         conn.close()
+
         def load_table(t):
             conn = psycopg2.connect(
                 host=RDBMS_HOST, port=RDBMS_PORT,
@@ -92,14 +89,7 @@ def ensure_dbt_models_for_lake():
 
     generate_schema_yml(lake_tables)
 
-    # Generate models for only missing DV tables
-    DBT_MODELS_PYTHON_DIR = os.path.join(os.path.dirname(__file__), "models", "python")
-    DELTA_PATH = os.getenv("DELTA_PATH", "delta_vault")
-    from utils import get_spark_session
-    spark = get_spark_session("DV-Model-Check")
-
-    from dv_modeller import extract_metadata, get_model_type, get_builder_code
-
+    # Generate JSON model metadata for each lake table
     new_models = []
     for table in lake_tables:
         df_schema = load_table(table)
@@ -110,9 +100,8 @@ def ensure_dbt_models_for_lake():
         for hub in hubs:
             model_name = hub["name"]
             bk = hub["key"]
-            builder_code = f'''out_df = df.select("{bk[0]}").distinct().withColumn("load_datetime", F.current_timestamp()).withColumn("{model_name}_hashkey", F.md5(F.concat_ws("||", df["{bk[0]}"].cast("string"))))'''
-            write_python_model_file(
-                model_name, builder_code, table, "hub", {'business_keys': bk, 'attributes': [], 'columns': [bk[0]]}
+            write_json_model_file(
+                model_name, table, "hub", {"business_keys": bk, "attributes": [], "columns": bk}
             )
             new_models.append(model_name)
 
@@ -120,11 +109,8 @@ def ensure_dbt_models_for_lake():
         for link in links:
             model_name = link["name"]
             keys = link["keys"]
-            key_select = ", ".join([f'"{k}"' for k in keys])
-            hash_expr = ", ".join([f'df["{k}"].cast("string")' for k in keys])
-            builder_code = f'''out_df = df.select({key_select}).distinct().withColumn("load_datetime", F.current_timestamp()).withColumn("{model_name}_hashkey", F.md5(F.concat_ws("||", {hash_expr})))'''
-            write_python_model_file(
-                model_name, builder_code, table, "link", {'business_keys': keys, 'attributes': [], 'columns': keys}
+            write_json_model_file(
+                model_name, table, "link", {"business_keys": keys, "attributes": [], "columns": keys}
             )
             new_models.append(model_name)
 
@@ -133,16 +119,9 @@ def ensure_dbt_models_for_lake():
             model_name = sat["name"]
             keys = sat["key"]
             atts = sat["attributes"]
-            select_cols = ", ".join([f'"{k}"' for k in keys + atts])
-            hashdiff_expr = ", ".join([f'df["{c}"].cast("string")' for c in atts])
-            builder_code = (
-                f'out_df = df.select({select_cols})'
-                f'.withColumn("load_datetime", F.current_timestamp())'
-                f'.withColumn("{model_name}_hashdiff", F.md5(F.concat_ws("||", {hashdiff_expr})))'
-            )
-            write_python_model_file(
-                model_name, builder_code, table, "sat",
-                {'business_keys': keys, 'attributes': atts, 'columns': keys + atts}
+            write_json_model_file(
+                model_name, table, "sat",
+                {"business_keys": keys, "attributes": atts, "columns": keys + atts},
             )
             new_models.append(model_name)
     return new_models
@@ -243,16 +222,35 @@ def streaming_dv_consumer_and_dbt():
             log.info(f"[DBT Model] Skipping {table_name}: could not infer schema")
             continue
         df_stream = get_kafka_stream(spark, table_name, schema)
-        meta = extract_metadata(df_stream)
-        model_type = get_model_type(meta)
-        model_name = f"{model_type}_{table_name}"
-        builder_code = get_builder_code(table_name, model_type, meta)
-        write_python_model_file(model_name, builder_code, table_name, model_type, meta)
-        log.info(f"[DBT Model] Generated: {model_name}.py")
+        meta = extract_metadata(table_name, df_stream)
+        hubs, links, sats = split_datavault(table_name, meta)
+
+        for hub in hubs:
+            write_json_model_file(
+                hub["name"], table_name, "hub",
+                {"business_keys": hub["key"], "attributes": [], "columns": hub["key"]},
+            )
+
+        for link in links:
+            write_json_model_file(
+                link["name"], table_name, "link",
+                {"business_keys": link["keys"], "attributes": [], "columns": link["keys"]},
+            )
+
+        for sat in sats:
+            write_json_model_file(
+                sat["name"], table_name, "sat",
+                {
+                    "business_keys": sat["key"],
+                    "attributes": sat["attributes"],
+                    "columns": sat["key"] + sat["attributes"],
+                },
+            )
+        log.info(f"[DBT Model] Generated metadata for: {table_name}")
 
     log.info("[DBT] Running all models...")
     ensure_profiles_dir()
-    exit_code = os.system(f"dbt run --profiles-dir {DBT_PROFILES_DIR} --select python/*")
+    exit_code = os.system(f"dbt run --profiles-dir {DBT_PROFILES_DIR} --select json/*")
     if exit_code != 0:
         raise RuntimeError(f"dbt run failed with exit code {exit_code}")
 
@@ -260,18 +258,17 @@ def streaming_dv_consumer_and_dbt():
 
 
 def main():
-    if os.path.exists(DBT_MODELS_PYTHON_DIR):
-        for f in os.listdir(DBT_MODELS_PYTHON_DIR):
-            os.remove(os.path.join(DBT_MODELS_PYTHON_DIR, f))
+    if os.path.exists(DBT_MODELS_JSON_DIR):
+        for f in os.listdir(DBT_MODELS_JSON_DIR):
+            os.remove(os.path.join(DBT_MODELS_JSON_DIR, f))
     else:
-        os.makedirs(DBT_MODELS_PYTHON_DIR, exist_ok=True)
+        os.makedirs(DBT_MODELS_JSON_DIR, exist_ok=True)
 
     new_models = ensure_dbt_models_for_lake()
     if new_models:
         log.info(f"[DBT] Running dbt for: {new_models}")
         ensure_profiles_dir()
-        for model in new_models:
-            os.system(f"dbt run --profiles-dir {DBT_PROFILES_DIR} --select {model}.py")
+        os.system(f"dbt run --profiles-dir {DBT_PROFILES_DIR}")
     else:
         log.info("NO new Data Vault tables to create, all up to date-")
     stop_event = threading.Event()

@@ -6,5 +6,6 @@ pandas
 delta-spark==2.4.0
 kafka-python==2.0.2
 psycopg2-binary
-dbt-spark[PyHive]
+pyarrow
+fastparquet
 git+ssh://git@github.com/Automated-Datavault-Schema-Evolution/MyLogger.git@v0.2.1#egg=mylogger
