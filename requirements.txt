@@ -1,6 +1,6 @@
 pyspark==3.4.1
 dbt-core
-dbt-spark[thrift]
+dbt-spark[PyHive]
 python-dotenv
 pandas
 delta-spark==2.4.0
