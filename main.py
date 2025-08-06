@@ -103,8 +103,8 @@ def ensure_dbt_models_for_lake():
     new_models = []
     for table in lake_tables:
         df_schema = load_table(table)
-        meta = extract_metadata(df_schema)
-        hubs, links, sats = split_datavault(table, meta['columns'])
+        meta = extract_metadata(table, df_schema)
+        hubs, links, sats = split_datavault(table, meta)
 
         # Generate Hubs
         for hub in hubs:

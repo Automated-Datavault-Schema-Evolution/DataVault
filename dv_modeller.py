@@ -1,55 +1,80 @@
-from itertools import combinations
+import re
 
-def extract_metadata(df):
+KEY_SUFFIXES = ["id", "nr", "key", "number"]
+
+
+def _normalize(name: str) -> str:
+    """Normalize a column name for comparison."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _strip_key_suffix(col: str) -> str:
+    """Remove standard key suffixes (id, code, key, nr, number)."""
+    col_lower = col.lower()
+    for suf in KEY_SUFFIXES:
+        if col_lower.endswith("_" + suf):
+            return col_lower[: -(len(suf) + 1)]
+        if col_lower.endswith(suf):
+            return col_lower[: -len(suf)]
+    return col_lower
+
+
+def _singularize(name: str) -> str:
+    """Very small helper to singularize table names."""
+    n = name.lower()
+    if n.endswith("ies"):
+        return n[:-3] + "y"
+    if n.endswith("s") and not n.endswith("ss"):
+        return n[:-1]
+    return n
+
+
+def extract_metadata(table_name, df):
     cols = list(df.columns)
-    business_keys = [c for c in cols if any(x in c.lower() for x in ["id", "nr", "key", "code", "number"])]
-    attributes = [c for c in cols if c not in business_keys]
+    key_candidates = [c for c in cols if any(x in c.lower() for x in KEY_SUFFIXES)]
+    base = _singularize(table_name)
+    hub_key = None
+    for c in key_candidates:
+        if _normalize(c).startswith(base):
+            hub_key = c
+            break
+    if not hub_key and key_candidates:
+        hub_key = key_candidates[0]
+    foreign_keys = [c for c in key_candidates if c != hub_key]
+    attributes = [c for c in cols if c not in key_candidates]
     return {
-        'columns': cols,
-        'business_keys': business_keys,
-        'attributes': attributes
+        "columns": cols,
+        "business_keys": [hub_key] + foreign_keys if hub_key else foreign_keys,
+        "attributes": attributes,
+        "hub_key": hub_key,
+        "foreign_keys": foreign_keys,
     }
 
-def split_datavault(table_name, columns):
-    business_keys = [c for c in columns if any(x in c.lower() for x in ["id", "nr", "key", "code", "number"])]
-    attributes = [c for c in columns if c not in business_keys]
+
+def split_datavault(table_name, meta):
+    hub_key = meta.get("hub_key")
+    foreign_keys = meta.get("foreign_keys", [])
+    attributes = meta.get("attributes", [])
+
+    base = _singularize(table_name)
 
     hubs = []
     links = []
     satellites = []
 
-    # Hubs
-    for bk in business_keys:
-        hubs.append({
-            "name": f"hub_{table_name}",
-            "key": [bk]
-        })
-
-    # Links (all 2-combinations)
-    for combo in combinations(business_keys, 2):
-        links.append({
-            "name": f"link_{'_'.join([bk.lower() for bk in combo])}",
-            "keys": list(combo)
-        })
-
-    # Satellites for each hub
-    for hub in hubs:
-        sat_atts = [a for a in attributes if a != hub["key"][0]]
-        if sat_atts:
+    if hub_key:
+        hubs.append({"name": f"hub_{base}", "key": [hub_key]})
+        if attributes:
             satellites.append({
-                "name": f"sat_{hub['key'][0].lower()}",
-                "key": hub["key"],
-                "attributes": sat_atts
+                "name": f"sat_{base}",
+                "key": [hub_key],
+                "attributes": attributes,
             })
-    # Satellites for each link
-    for link in links:
-        sat_atts = attributes
-        if sat_atts:
-            satellites.append({
-                "name": f"sat_{'_'.join([k.lower() for k in link['keys']])}",
-                "key": link["keys"],
-                "attributes": sat_atts
-            })
+
+    for fk in foreign_keys:
+        fk_base = _singularize(_strip_key_suffix(fk))
+        link_name = f"link_{base}_{fk_base}"
+        links.append({"name": link_name, "keys": [hub_key, fk]})
 
     return hubs, links, satellites
 
@@ -76,6 +101,7 @@ def get_model_type(meta):
         return "sat"
     # fallback (treat as sat)
     return "sat"
+
 
 def get_builder_code(table_name, model_type, meta):
     bk = meta.get('business_keys', [])
