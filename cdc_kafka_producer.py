@@ -112,6 +112,56 @@ def save_watermarks(wm):
     with open(WATERMARK_FILE, "w") as f:
         json.dump(wm, f)
 
+def produce_tables_once(tables):
+    """Produce all rows for the given tables exactly once."""
+    check_and_create_topic()
+
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        linger_ms=100,
+        acks='all'
+    )
+
+    if LAKE_TYPE == "parquet":
+        load_func = load_parquet_table
+    elif LAKE_TYPE == "rdbms":
+        load_func = load_rdbms_table
+    else:
+        raise ValueError("Unknown LAKE_TYPE (must be 'parquet' or 'rdbms')")
+
+    watermarks = load_watermarks()
+    for table in tables:
+        log.info(f"[CDC Producer] Initial load for {table}")
+        try:
+            df = load_func(table)
+        except Exception as e:
+            log.info(f"Error loading {table}: {e}")
+            continue
+        if "modified_at" not in df.columns:
+            log.warning(f"Table {table} skipped: no 'modified_at' column for CDC.")
+            continue
+        df = df.dropna(subset=["modified_at"])
+        for _, row in df.iterrows():
+            payload = row.dropna().to_dict()
+            producer.send(
+                KAFKA_TOPIC,
+                {
+                    "table": table,
+                    "payload": json.dumps(payload, default=str),
+                    "cdc_type": "insert",
+                    "modified_at": payload["modified_at"],
+                },
+            )
+        if not df.empty:
+            max_ts = df["modified_at"].max()
+            watermarks[table] = max_ts
+            log.info(f"[CDC Producer] Produced {len(df)} events for {table}. Watermark: {max_ts}")
+
+    producer.flush()
+    save_watermarks(watermarks)
+    producer.close()
+
 def cdc_producer_insert_only():
     # Ensure topic exists and is ready
     check_and_create_topic()

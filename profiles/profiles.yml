@@ -6,7 +6,13 @@ default:
       type: spark
       method: thrift
       schema: default
-      host: host.docker.internal
+
+
+      #optional
+      # host: datavault-ingestion-spark-thrift    # docker
+      host: host.docker.internal      # local
       port: 7079
       user: dbt
       threads: 3
+      server_side_parameters:
+        "spark.driver.memory": "4g"
