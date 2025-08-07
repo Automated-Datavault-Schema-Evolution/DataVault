@@ -2,6 +2,7 @@ import json
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json
 from pyspark.sql.types import StructType, StructField, StringType
+from logger import log
 
 from config import (
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID,
@@ -9,6 +10,10 @@ from config import (
 )
 
 def get_spark():
+    log.info("Initializing Spark session for staging loader")
+    log.debug(
+        f"Spark config master={SPARK_MASTER}, driver_memory={SPARK_DRIVER_MEMORY}, executor_memory={SPARK_EXECUTOR_MEMORY}"
+    )
     spark = (
         SparkSession.builder
         .master(SPARK_MASTER)
@@ -22,6 +27,15 @@ def get_spark():
     return spark
 
 def get_kafka_stream(spark, table_name, schema):
+    if schema is None:
+        log.error(f"No schema provided for table '{table_name}'")
+        return None
+    if not table_name:
+        log.warning("Table name not specified for Kafka stream")
+    log.info(f"Creating Kafka stream for table '{table_name}'")
+    log.debug(
+        f"Kafka config bootstrap_servers={KAFKA_BOOTSTRAP_SERVERS}, topic={KAFKA_TOPIC}, startingOffsets={KAFKA_STARTING_OFFSETS}, groupIdPrefix={KAFKA_GROUP_ID}"
+    )
     json_schema = StructType([
         StructField("table", StringType()),
         StructField("payload", StringType()),
@@ -40,4 +54,5 @@ def get_kafka_stream(spark, table_name, schema):
     df_json = df.select(from_json(col("value").cast("string"), json_schema).alias("json"))
     df_table = df_json.filter(col("json.table") == table_name)
     df_data = df_table.select(from_json(col("json.payload"), schema).alias("data")).select("data.*")
+    log.debug(f"Kafka stream for '{table_name}' configured")
     return df_data

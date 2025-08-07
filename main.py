@@ -56,7 +56,9 @@ def discover_lake():
             conn.close()
             return pd.DataFrame(columns=colnames)
     else:
+        log.critical(f"Unknown LAKE_TYPE '{LAKE_TYPE}'")
         raise ValueError("Unknown LAKE_TYPE")
+    log.info(f"Discovered {len(tables)} table(s) in {LAKE_TYPE} lake")
     return tables, load_table
 
 def ensure_database_schema():
@@ -315,8 +317,9 @@ def streaming_dv_consumer_and_dbt():
     ensure_database_schema()
     exit_code = os.system(f"dbt run --profiles-dir {DBT_PROFILES_DIR}")
     if exit_code != 0:
+        log.critical(f"dbt run failed with exit code {exit_code}")
         raise RuntimeError(f"dbt run failed with exit code {exit_code}")
-
+    log.info("dbt run completed successfully")
 
 
 

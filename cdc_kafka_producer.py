@@ -58,6 +58,7 @@ def check_and_create_topic(
             log.error(f"[Kafka] Waiting for topic '{topic_name}'... ({e})")
         time.sleep(1)
         if time.time() - start > timeout_sec:
+            log.critical(f"[Kafka] Timeout: Topic '{topic_name}' does not have partitions after {timeout_sec} seconds.")
             raise TimeoutError(f"[Kafka] Timeout: Topic '{topic_name}' does not have partitions after {timeout_sec} seconds.")
 
 # Parquet helpers
@@ -104,8 +105,10 @@ def load_rdbms_table(table_name):
 
 def load_watermarks():
     if os.path.exists(WATERMARK_FILE):
+        log.debug(f"Loading watermarks from {WATERMARK_FILE}")
         with open(WATERMARK_FILE, "r") as f:
             return json.load(f)
+    log.info("No watermark file found; starting fresh")
     return {}
 
 def save_watermarks(wm):
@@ -128,6 +131,7 @@ def produce_tables_once(tables):
     elif LAKE_TYPE == "rdbms":
         load_func = load_rdbms_table
     else:
+        log.critical(f"Unknown LAKE_TYPE '{LAKE_TYPE}' (must be 'parquet' or 'rdbms')")
         raise ValueError("Unknown LAKE_TYPE (must be 'parquet' or 'rdbms')")
 
     watermarks = load_watermarks()
@@ -182,6 +186,7 @@ def cdc_producer_insert_only():
             tables = get_rdbms_tables()
             load_func = load_rdbms_table
         else:
+            log.critical(f"Unknown LAKE_TYPE '{LAKE_TYPE}' (must be 'parquet' or 'rdbms')")
             raise ValueError("Unknown LAKE_TYPE (must be 'parquet' or 'rdbms')")
         for table in tables:
             log.info(f"[CDC Producer] Scanning {table}")
