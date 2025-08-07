@@ -23,14 +23,14 @@ KAFKA_STARTING_OFFSETS = os.getenv("KAFKA_STARTING_OFFSETS", "earliest")
 KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "datalake-stream")
 
 # Spark
-SPARK_MASTER = os.getenv("SPARK_MASTER", "spark://datavault-ingestion-spark-master:7077")
+SPARK_MASTER = os.getenv("SPARK_MASTER", "spark://datavault-ingestion-spark-master:7078")
 # Location where Spark stores managed tables; mount this path to persist the vault
 SPARK_WAREHOUSE_DIR = os.getenv("SPARK_WAREHOUSE_DIR", "/data/warehouse")
 # Spark resource tuning parameters
-SPARK_DRIVER_MEMORY = os.getenv("SPARK_DRIVER_MEMORY", "2g")
-SPARK_EXECUTOR_MEMORY = os.getenv("SPARK_EXECUTOR_MEMORY", "2g")
-SPARK_DRIVER_CORES = os.getenv("SPARK_DRIVER_CORES", "1")
-SPARK_EXECUTOR_CORES = os.getenv("SPARK_EXECUTOR_CORES", "1")
+SPARK_DRIVER_MEMORY = os.getenv("SPARK_DRIVER_MEMORY", "6g")
+SPARK_EXECUTOR_MEMORY = os.getenv("SPARK_EXECUTOR_MEMORY", "6g")
+SPARK_DRIVER_CORES = os.getenv("SPARK_DRIVER_CORES", "4")
+SPARK_EXECUTOR_CORES = os.getenv("SPARK_EXECUTOR_CORES", "4")
 SPARK_SQL_SHUFFLE_PARTITIONS = int(os.getenv("SPARK_SQL_SHUFFLE_PARTITIONS", "200"))
 SPARK_DYNAMIC_ALLOCATION = os.getenv("SPARK_DYNAMIC_ALLOCATION", "false").lower() == "true"
 # Optional dynamic allocation parameters
@@ -71,4 +71,5 @@ DBT_MODELS_JSON_DIR = os.path.join(os.path.dirname(__file__), "models", "json")
 
 # Thift Connection
 THRIFT_HOST = os.getenv("THRIFT_HOST", "localhost")
-THRIFT_PORT = int(os.getenv("THRIFT_PORT", "10000"))
+THRIFT_PORT = int(os.getenv("THRIFT_PORT", "7079"))
+THRIFT_AUTH = os.getenv("THRIFT_AUTH", "NOSASL")
