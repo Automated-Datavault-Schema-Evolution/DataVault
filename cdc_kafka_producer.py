@@ -106,14 +106,27 @@ def load_rdbms_table(table_name):
 def load_watermarks():
     if os.path.exists(WATERMARK_FILE):
         log.debug(f"Loading watermarks from {WATERMARK_FILE}")
-        with open(WATERMARK_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(WATERMARK_FILE, "r") as f:
+                content = f.read().strip()
+                if not content:
+                    log.info(f"Watermark file {WATERMARK_FILE} is empty; starting fresh")
+                    return {}
+                return json.loads(content)
+        except (OSError, json.JSONDecodeError) as e:
+            log.warning(f"Could not parse watermark file {WATERMARK_FILE}: {e}; starting fresh")
+            return {}
     log.info("No watermark file found; starting fresh")
     return {}
 
 def save_watermarks(wm):
+    serializable = {}
+    for tbl, ts in wm.items():
+        if ts is None or pd.isna(ts):
+            continue
+        serializable[tbl] = str(ts)
     with open(WATERMARK_FILE, "w") as f:
-        json.dump(wm, f)
+        json.dump(serializable, f)
 
 def produce_tables_once(tables):
     """Produce all rows for the given tables exactly once."""
@@ -199,7 +212,7 @@ def cdc_producer_insert_only():
                 log.warning(f"Table {table} skipped: no 'modified_at' column for CDC.")
                 continue
             last_ts = watermarks.get(table)
-            if last_ts is not None:
+            if last_ts is not None and not pd.isna(last_ts):
                 new_rows = df[df["modified_at"] > last_ts]
             else:
                 new_rows = df
