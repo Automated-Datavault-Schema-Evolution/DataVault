@@ -18,7 +18,9 @@ from config import (
     SPARK_DYNAMIC_ALLOCATION_INITIAL_EXECUTORS,
     SPARK_SERIALIZER,
     SPARK_KRYO_BUFFER_MAX,
-    SPARK_ADAPTIVE_EXECUTION, SPARK_DYNAMIC_SHUFFLE_TRACKING,
+    SPARK_ADAPTIVE_EXECUTION,
+    SPARK_DYNAMIC_SHUFFLE_TRACKING,
+    SPARK_WAREHOUSE_DIR,
 )
 
 
@@ -64,6 +66,7 @@ def get_spark_session(app_name="Kafka_Consumer_Lake_Handler"):
         "org.apache.kafka:kafka-clients:3.5.1",
         "org.apache.spark:spark-token-provider-kafka-0-10_2.12:3.5.6"
     ]
-    spark = configure_spark_with_delta_pip(builder, extra_packages=my_packages).getOrCreate()
+    builder = builder.config("spark.jars.packages", ",".join(my_packages))
+    spark = builder.getOrCreate()
     log.debug(f"Spark configuration: {spark.sparkContext.getConf().getAll()}")
     return spark

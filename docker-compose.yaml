@@ -9,7 +9,7 @@ services:
     env_file: .env.docker
     volumes:
       - ./:/app
-      - ${HOST_DATA_DIRECTORY}:/app/data
+      - ${HOST_DATA_DIRECTORY}:/data
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - data_automation-net
@@ -21,6 +21,8 @@ services:
   datavault-ingestion-spark-master:
     image: ${SPARK_WORKER_IMAGE}
     container_name: datavault-ingestion-spark-master
+    volumes:
+      - ${HOST_DATA_DIRECTORY}:/data
     environment:
       - SPARK_MODE=master
       - SPARK_MASTER_PORT=7078
@@ -36,6 +38,8 @@ services:
 
   datavault-ingestion-spark-worker-1:
     image: ${SPARK_WORKER_IMAGE}
+    volumes:
+      - ${HOST_DATA_DIRECTORY}:/data
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://datavault-ingestion-spark-master:7078
@@ -52,6 +56,8 @@ services:
 
   datavault-ingestion-spark-worker-2:
     image: ${SPARK_WORKER_IMAGE}
+    volumes:
+      - ${HOST_DATA_DIRECTORY}:/data
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://datavault-ingestion-spark-master:7078
@@ -74,6 +80,8 @@ services:
       "--master", "spark://datavault-ingestion-spark-master:7078",
       "--hiveconf", "hive.server2.thrift.port=7079"
     ]
+    volumes:
+      - ${HOST_DATA_DIRECTORY}:/data
     environment:
       - SPARK_NO_DAEMONIZE=true
     depends_on:

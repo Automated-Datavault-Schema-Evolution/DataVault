@@ -1,6 +1,6 @@
 FROM python:3.10-slim-bullseye
 
-# Java 11 is officially supported by Spark 3.x and Delta Lake
+# Java 11 is officially supported by Spark 3.x
 RUN apt-get update && apt-get install -y \
     gcc \
     libglib2.0-0 \

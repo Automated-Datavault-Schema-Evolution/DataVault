@@ -3,7 +3,6 @@ dbt-core
 dbt-spark[PyHive]
 python-dotenv
 pandas
-delta-spark==2.4.0
 kafka-python==2.0.2
 psycopg2-binary
 pyarrow

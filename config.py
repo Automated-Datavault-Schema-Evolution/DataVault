@@ -24,6 +24,8 @@ KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "datalake-stream")
 
 # Spark
 SPARK_MASTER = os.getenv("SPARK_MASTER", "spark://datavault-ingestion-spark-master:7077")
+# Location where Spark stores managed tables; mount this path to persist the vault
+SPARK_WAREHOUSE_DIR = os.getenv("SPARK_WAREHOUSE_DIR", "/data/warehouse")
 # Spark resource tuning parameters
 SPARK_DRIVER_MEMORY = os.getenv("SPARK_DRIVER_MEMORY", "2g")
 SPARK_EXECUTOR_MEMORY = os.getenv("SPARK_EXECUTOR_MEMORY", "2g")
