@@ -28,17 +28,53 @@ def _append_parquet(row, path):
         df = row
     df.to_parquet(path, index=False)
 
-def _append_db(data, table):
-    with psycopg2.connect(
+def _ensure_metastore_conn():
+    """Return connection to the metastore database, creating it if missing."""
+    try:
+        return psycopg2.connect(
             host=METASTORE_DB_HOST,
             port=METASTORE_DB_PORT,
             dbname=METASTORE_DB,
             user=METASTORE_DB_USER,
             password=METASTORE_DB_PASSWORD,
-    ) as conn:
+        )
+    except psycopg2.OperationalError as exc:
+        if "does not exist" not in str(exc):
+            raise
+        # Connect to the default postgres database to create the metastore
+        with psycopg2.connect(
+            host=METASTORE_DB_HOST,
+            port=METASTORE_DB_PORT,
+            dbname="postgres",
+            user=METASTORE_DB_USER,
+            password=METASTORE_DB_PASSWORD,
+        ) as bootstrap_conn:
+            bootstrap_conn.autocommit = True
+            with bootstrap_conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("CREATE DATABASE {}" ).format(
+                        sql.Identifier(METASTORE_DB)
+                    )
+                )
+        return psycopg2.connect(
+            host=METASTORE_DB_HOST,
+            port=METASTORE_DB_PORT,
+            dbname=METASTORE_DB,
+            user=METASTORE_DB_USER,
+            password=METASTORE_DB_PASSWORD,
+        )
+
+
+def _append_db(data, table):
+    with _ensure_metastore_conn() as conn:
         with conn.cursor() as cur:
-            # Ensure target table exists.  Each record is stored as JSONB to
-            # keep the schema flexible.
+            # Ensure schema and target table exist.  Each record is stored as
+            # JSONB to keep the schema flexible.
+            cur.execute(
+                sql.SQL("CREATE SCHEMA IF NOT EXISTS {}" ).format(
+                    sql.Identifier(METASTORE_DB_SCHEMA)
+                )
+            )
             cur.execute(
                 sql.SQL(
                     """
