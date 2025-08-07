@@ -4,11 +4,13 @@ import json
 import time
 import threading
 import pandas as pd
+import yaml
+from pyhive import hive
 from cdc_kafka_producer import cdc_producer_insert_only
 from config import (
     LAKE_TYPE, PARQUET_PATH,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
-    RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR,
+    RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT,
 )
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
@@ -18,6 +20,30 @@ from logger import log
 # Directory where JSON model descriptions will be written
 # (configured via DBT_MODELS_JSON_DIR in config.py)
 WATERMARK_FILE = "cdc_watermarks.json"
+
+def ensure_database_schema():
+    """Create target Spark database/schema if it does not exist."""
+    profiles_yml_path = os.path.join(DBT_PROFILES_DIR, "profiles.yml")
+    if not os.path.exists(profiles_yml_path):
+        return
+    with open(profiles_yml_path, "r") as f:
+        profiles = yaml.safe_load(f) or {}
+    default_profile = profiles.get("default", {})
+    target = default_profile.get("target")
+    outputs = default_profile.get("outputs", {})
+    target_cfg = outputs.get(target, {})
+    schema = target_cfg.get("schema") or target_cfg.get("database")
+    if not schema:
+        return
+    host = target_cfg.get("host", THRIFT_HOST)
+    port = int(target_cfg.get("port", THRIFT_PORT))
+    user = target_cfg.get("user")
+    conn = hive.Connection(host=host, port=port, username=user)
+    cursor = conn.cursor()
+    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {schema}")
+    cursor.close()
+    conn.close()
+    log.info(f"[DB] Ensured database/schema '{schema}' exists")
 
 def write_json_model_file(model_name, table_name, model_type, meta):
     """Persist model metadata as JSON for dbt-spark."""
@@ -250,7 +276,8 @@ def streaming_dv_consumer_and_dbt():
 
     log.info("[DBT] Running all models...")
     ensure_profiles_dir()
-    exit_code = os.system(f"dbt run --profiles-dir {DBT_PROFILES_DIR} --select json/*")
+    ensure_database_schema()
+    exit_code = os.system(f"dbt run --profiles-dir {DBT_PROFILES_DIR}")
     if exit_code != 0:
         raise RuntimeError(f"dbt run failed with exit code {exit_code}")
 
@@ -271,6 +298,7 @@ def main():
         os.system(f"dbt run --profiles-dir {DBT_PROFILES_DIR}")
     else:
         log.info("NO new Data Vault tables to create, all up to date-")
+    ensure_database_schema()
     stop_event = threading.Event()
     cdc_thread = threading.Thread(target=cdc_producer_insert_only, daemon=True)
     cdc_thread.start()
