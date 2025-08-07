@@ -10,7 +10,7 @@ from cdc_kafka_producer import cdc_producer_insert_only
 from config import (
     LAKE_TYPE, PARQUET_PATH,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
-    RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, THRIFT_AUTH,
+    RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, THRIFT_AUTH, DBT_MODELS_SQL_DIR
 )
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
@@ -95,6 +95,29 @@ def ensure_database_schema():
     conn.close()
     log.info(f"[DB] Ensured database/schema '{schema}' exists")
 
+def write_sql_model_file(model_name, table_name, model_type, meta):
+    """Create a dbt SQL model file based on JSON metadata."""
+    os.makedirs(DBT_MODELS_SQL_DIR, exist_ok=True)
+    file_path = os.path.join(DBT_MODELS_SQL_DIR, f"{model_name}.sql")
+    business_keys = meta.get("business_keys", [])
+    attributes = meta.get("attributes", [])
+    columns = business_keys + attributes
+
+    lines = ["{{ config(materialized='table') }}", "", "select"]
+
+    for col in columns:
+        lines.append(f"    {col},")
+
+    lines.append("    current_timestamp() as load_datetime,")
+    lines.append(f"    '{table_name}' as record_source")
+    lines.append(f"from {{ source('staging', '{table_name}') }}")
+
+    if model_type in {"hub", "link"} and business_keys:
+        lines.append(f"group by {', '.join(business_keys)}")
+
+    with open(file_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
 def write_json_model_file(model_name, table_name, model_type, meta):
     """Persist model metadata as JSON for dbt-spark."""
     os.makedirs(DBT_MODELS_JSON_DIR, exist_ok=True)
@@ -109,7 +132,18 @@ def write_json_model_file(model_name, table_name, model_type, meta):
     }
     with open(file_path, "w") as file:
         json.dump(model_def, file, indent=2)
+    write_sql_model_file(model_name, table_name, model_type, model_def)
     write_metadata(model_def)
+    write_lineage(
+        {
+            "source_table": table_name,
+            "target_model": model_name,
+            "model_type": model_type,
+            "business_keys": meta.get("business_keys", []),
+            "attributes": meta.get("attributes", []),
+            "columns": meta.get("columns", []),
+        }
+    )
     log.info(f"[GEN] Generated DBT JSON model for {model_name} (from lake table {table_name})")
 
 def generate_schema_yml(table_names, output_path="models/schema.yml"):
@@ -172,7 +206,11 @@ def get_existing_model_tables():
             continue
         with open(os.path.join(DBT_MODELS_JSON_DIR, fname), "r") as f:
             data = json.load(f)
-        table_models.setdefault(data.get("table_name"), []).append(data.get("model_name"))
+        table_name = data.get("table_name")
+        model_name = data.get("model_name")
+        model_type = data.get("model_type")
+        write_sql_model_file(model_name, table_name, model_type, data)
+        table_models.setdefault(table_name, []).append(model_name)
     return table_models
 
 def get_raw_vault_tables():

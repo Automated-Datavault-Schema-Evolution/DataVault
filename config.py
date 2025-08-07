@@ -68,6 +68,7 @@ PROCESSING_MODE = os.getenv("PROCESSING_MODE", "streaming")
 # DBT
 DBT_PROFILES_DIR = os.path.join(os.path.dirname(__file__), "profiles")
 DBT_MODELS_JSON_DIR = os.path.join(os.path.dirname(__file__), "models", "json")
+DBT_MODELS_SQL_DIR = os.path.join(os.path.dirname(__file__), "models", "sql")
 
 # Thift Connection
 THRIFT_HOST = os.getenv("THRIFT_HOST", "localhost")
