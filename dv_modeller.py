@@ -112,15 +112,16 @@ def get_model_type(meta):
 
     # If only one BK and (almost) all columns are BKs or audit fields, it's a Hub
     if n_bk == 1:
-        return "hub"
-    # Link: more than 1 BK, and all columns are BKs or standard audit columns
-    audit_cols = {"load_datetime", "created_at", "modified_at", "record_source"}
-    non_bk = [c for c in cols if c not in bk and c.lower() not in audit_cols]
-    if n_bk > 1 and len(non_bk) == 0:
-        return "link"
-    # If has at least one BK and at least one non-key column, it's a Satellite
-    if n_bk >= 1 and len(non_bk) > 0:
-        return "sat"
-    # fallback (treat as sat)
-    return "sat"
-
+        model = "hub"
+    else:
+        audit_cols = {"load_datetime", "created_at", "modified_at", "record_source"}
+        non_bk = [c for c in cols if c not in bk and c.lower() not in audit_cols]
+        if n_bk > 1 and len(non_bk) == 0:
+            model = "link"
+        elif n_bk >= 1 and len(non_bk) > 0:
+            model = "sat"
+        else:
+            model = "sat"
+            log.error("Unable to classify model type clearly; defaulting to 'sat'")
+    log.info(f"Model type determined: {model}")
+    return model
