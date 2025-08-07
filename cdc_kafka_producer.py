@@ -112,7 +112,15 @@ def load_watermarks():
                 if not content:
                     log.info(f"Watermark file {WATERMARK_FILE} is empty; starting fresh")
                     return {}
-                return json.loads(content)
+                raw = json.loads(content)
+                parsed = {}
+                for tbl, ts in raw.items():
+                    parsed_ts = pd.to_datetime(ts, errors="coerce")
+                    if pd.isna(parsed_ts):
+                        log.warning(f"Ignoring invalid watermark for {tbl}: {ts}")
+                    else:
+                        parsed[tbl] = parsed_ts
+                return parsed
         except (OSError, json.JSONDecodeError) as e:
             log.warning(f"Could not parse watermark file {WATERMARK_FILE}: {e}; starting fresh")
             return {}
@@ -161,13 +169,17 @@ def produce_tables_once(tables):
         df = df.dropna(subset=["modified_at"])
         for _, row in df.iterrows():
             payload = row.dropna().to_dict()
+            modified_at = payload.get("modified_at")
+            if isinstance(modified_at, pd.Timestamp):
+                modified_at = modified_at.isoformat()
+            payload["modified_at"] = modified_at
             producer.send(
                 KAFKA_TOPIC,
                 {
                     "table": table,
                     "payload": json.dumps(payload, default=str),
                     "cdc_type": "insert",
-                    "modified_at": payload["modified_at"],
+                    "modified_at": modified_at,
                 },
             )
         if not df.empty:
@@ -221,13 +233,17 @@ def cdc_producer_insert_only():
             new_rows = new_rows.dropna(subset=["modified_at"])
             for _, row in new_rows.iterrows():
                 payload = row.dropna().to_dict()
+                modified_at = payload.get("modified_at")
+                if isinstance(modified_at, pd.Timestamp):
+                    modified_at = modified_at.isoformat()
+                payload["modified_at"] = modified_at
                 producer.send(
                     KAFKA_TOPIC,
                     {
                         "table": table,
                         "payload": json.dumps(payload, default=str),
                         "cdc_type": "insert",
-                        "modified_at": payload["modified_at"]
+                        "modified_at": modified_at
                     }
                 )
             max_ts = new_rows["modified_at"].max()
