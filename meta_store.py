@@ -1,4 +1,4 @@
-import datetime
+from datetime import datetime
 import os
 import uuid
 
@@ -194,7 +194,7 @@ def _append_db(data, table):
 def write_lineage(metadata_dict):
     """Append lineage information to the lineage metastore."""
     metadata_dict.setdefault("lineage_id", str(uuid.uuid4()))
-    metadata_dict.setdefault("logged_at", datetime.utcnow().isoformat())
+    metadata_dict.setdefault("logged_at", datetime.now().isoformat())
 
     if LAKE_TYPE == "rdbms":
         _append_db(metadata_dict, "lineage")
