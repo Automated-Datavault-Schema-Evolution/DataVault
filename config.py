@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 env_type = os.getenv('ENV_TYPE', "local")
 load_dotenv(f".env.{env_type}")
-load_dotenv(dotenv_path="postgres/db.env")
+
 
 LAKE_TYPE = os.getenv("LAKE_TYPE", "rdbms")
 PARQUET_PATH = os.getenv("PARQUET_PATH", "parquet_files")
@@ -49,13 +49,24 @@ SPARK_WORKER_CONTAINER_PREFIX = os.getenv("SPARK_WORKER_CONTAINER_PREFIX", "spar
 SPARK_WORKER_CPU_THRESHOLD = float(os.getenv("SPARK_WORKER_CPU_THRESHOLD", "80"))
 DOCKER_NETWORK = os.getenv("DOCKER_NETWORK", "data_automation-net")
 
+# Meta store
 METADATA_LINEAGE_TYPE = os.getenv("METADATA_LINEAGE_TYPE", "parquet")
 METADATA_LINEAGE_PATH = os.getenv("METADATA_LINEAGE_PATH", "meta/lineage.parquet")
 METADATA_METADATA_PATH = os.getenv("METADATA_METADATA_PATH", "meta/metadata.parquet")
+METASTORE_DB_HOST = os.getenv("METASTORE_DB_HOST", RDBMS_HOST)
+METASTORE_DB_PORT = int(os.getenv("METASTORE_DB_PORT", RDBMS_PORT))
+METASTORE_DB = os.getenv("METASTORE_DB", 'META_MART')
+METASTORE_DB_USER = os.getenv("METASTORE_DB_USER", RDBMS_USER)
+METASTORE_DB_PASSWORD = os.getenv("METASTORE_DB_PASSWORD", RDBMS_PASSWORD)
+METASTORE_DB_SCHEMA = os.getenv("METASTORE_DB_SCHEMA", 'metastore')
+
+
 PROCESSING_MODE = os.getenv("PROCESSING_MODE", "streaming")
 
+# DBT
 DBT_PROFILES_DIR = os.path.join(os.path.dirname(__file__), "profiles")
 DBT_MODELS_JSON_DIR = os.path.join(os.path.dirname(__file__), "models", "json")
+
 # Thift Connection
 THRIFT_HOST = os.getenv("THRIFT_HOST", "localhost")
 THRIFT_PORT = int(os.getenv("THRIFT_PORT", "10000"))
