@@ -57,7 +57,7 @@ def get_spark_session(app_name="Kafka_Consumer_Lake_Handler"):
     builder = builder.config("spark.pyspark.python", python_exec) \
         .config("spark.pyspark.driver.python", python_exec) \
         .config("spark.sql.streaming.kafka.useUninterruptibleThread", "true") \
-
+        .config("spark.sql.warehouse.dir", SPARK_WAREHOUSE_DIR)
     my_packages = [
         "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.6",
         "org.apache.kafka:kafka-clients:3.5.1",
