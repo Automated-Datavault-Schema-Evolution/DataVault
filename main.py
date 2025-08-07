@@ -10,7 +10,7 @@ from cdc_kafka_producer import cdc_producer_insert_only
 from config import (
     LAKE_TYPE, PARQUET_PATH,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
-    RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT,
+    RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, THRIFT_AUTH,
 )
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
@@ -20,6 +20,18 @@ from logger import log
 # Directory where JSON model descriptions will be written
 # (configured via DBT_MODELS_JSON_DIR in config.py)
 WATERMARK_FILE = "cdc_watermarks.json"
+
+def _resolve_thrift(target_cfg):
+    """Resolve Hive Thrift connection parameters with env taking precedence."""
+    env_host = os.environ.get("THRIFT_HOST")
+    env_port = os.environ.get("THRIFT_PORT")
+    env_auth = os.environ.get("THRIFT_AUTH")
+    host = env_host or target_cfg.get("host") or THRIFT_HOST
+    port = int(env_port or target_cfg.get("port") or THRIFT_PORT)
+    auth = env_auth or THRIFT_AUTH
+    user = target_cfg.get("user")
+    log.debug(f"Using Hive Thrift server host={host}, port={port}, auth={auth}")
+    return host, port, user, auth
 
 def discover_lake():
     """Return available lake tables and a loader function."""
@@ -75,10 +87,8 @@ def ensure_database_schema():
     schema = target_cfg.get("schema") or target_cfg.get("database")
     if not schema:
         return
-    host = target_cfg.get("host", THRIFT_HOST)
-    port = int(target_cfg.get("port", THRIFT_PORT))
-    user = target_cfg.get("user")
-    conn = hive.Connection(host=host, port=port, username=user)
+    host, port, user, auth = _resolve_thrift(target_cfg)
+    conn = hive.Connection(host=host, port=port, username=user, auth=auth)
     cursor = conn.cursor()
     cursor.execute(f"CREATE DATABASE IF NOT EXISTS {schema}")
     cursor.close()
@@ -179,10 +189,8 @@ def get_raw_vault_tables():
     schema = target_cfg.get("schema") or target_cfg.get("database")
     if not schema:
         return set()
-    host = target_cfg.get("host", THRIFT_HOST)
-    port = int(target_cfg.get("port", THRIFT_PORT))
-    user = target_cfg.get("user")
-    conn = hive.Connection(host=host, port=port, username=user, database=schema)
+    host, port, user, auth = _resolve_thrift(target_cfg)
+    conn = hive.Connection(host=host, port=port, username=user, auth=auth)
     cursor = conn.cursor()
     cursor.execute("SHOW TABLES")
     tables = [row[0] for row in cursor.fetchall()]
