@@ -6,6 +6,7 @@
 /artifacts
 /models
 *.json
+*.parquet
 
 /target
 /logs

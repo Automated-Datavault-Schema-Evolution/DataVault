@@ -9,4 +9,11 @@ tmp/
 
 /artifacts
 /models
+/logs
+/meta
+/metastore_db
+/target
+/data
+*.log
 *.json
+*.parquet
