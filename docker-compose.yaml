@@ -78,7 +78,8 @@ services:
     entrypoint: /opt/spark/sbin/start-thriftserver.sh
     command: [
       "--master", "spark://datavault-ingestion-spark-master:7078",
-      "--hiveconf", "hive.server2.thrift.port=7079"
+      "--hiveconf", "hive.server2.thrift.port=7079",
+      "--hiveconf", "hive.server2.authentication=NOSASL"
     ]
     volumes:
       - ${HOST_DATA_DIRECTORY}:/data
