@@ -5,7 +5,7 @@
   </property>
   <property>
     <name>hive.metastore.warehouse.dir</name>
-    <value>/opt/spark/warehouse</value>
+    <value>/data/spark/warehouse</value>
   </property>
   <property>
     <name>hive.execution.engine</name>
