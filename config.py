@@ -7,6 +7,8 @@ load_dotenv(f".env.{env_type}")
 
 LAKE_TYPE = os.getenv("LAKE_TYPE", "rdbms")
 PARQUET_PATH = os.getenv("PARQUET_PATH", "parquet_files")
+STAGING_SCHEMA = os.getenv("STAGING_SCHEMA", "bronze")
+RAW_VAULT_SCHEMA = os.getenv("RAW_VAULT_SCHEMA", "raw_vault")
 
 # RDBMS settings
 RDBMS_HOST = os.getenv("POSTGRES_HOST", "localhost")
@@ -25,7 +27,8 @@ KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "datalake-stream")
 # Spark
 SPARK_MASTER = os.getenv("SPARK_MASTER", "spark://datavault-ingestion-spark-master:7078")
 # Location where Spark stores managed tables; mount this path to persist the vault
-SPARK_WAREHOUSE_DIR = os.getenv("SPARK_WAREHOUSE_DIR", "/data/warehouse")
+HOST_SPARK_WAREHOUSE_DIR = os.getenv("HOST_SPARK_WAREHOUSE_DIR", "./data/spark/warehouse")
+CONTAINER_SPARK_WAREHOUSE_DIR = os.getenv("CONTAINER_SPARK_WAREHOUSE_DIR", "/data/spark/warehouse")
 # Spark resource tuning parameters
 SPARK_DRIVER_MEMORY = os.getenv("SPARK_DRIVER_MEMORY", "6g")
 SPARK_EXECUTOR_MEMORY = os.getenv("SPARK_EXECUTOR_MEMORY", "6g")
@@ -51,6 +54,11 @@ SPARK_WORKER_CONTAINER_PREFIX = os.getenv("SPARK_WORKER_CONTAINER_PREFIX", "spar
 SPARK_WORKER_CPU_THRESHOLD = float(os.getenv("SPARK_WORKER_CPU_THRESHOLD", "80"))
 DOCKER_NETWORK = os.getenv("DOCKER_NETWORK", "data_automation-net")
 
+# Thift Connection
+THRIFT_HOST = os.getenv("THRIFT_HOST", "localhost")
+THRIFT_PORT = int(os.getenv("THRIFT_PORT", "10000"))
+THRIFT_AUTH = os.getenv("THRIFT_AUTH", "NOSASL")
+
 # Meta store
 METADATA_LINEAGE_TYPE = os.getenv("METADATA_LINEAGE_TYPE", "parquet")
 METADATA_LINEAGE_PATH = os.getenv("METADATA_LINEAGE_PATH", "meta/lineage.parquet")
@@ -61,6 +69,7 @@ METASTORE_DB = os.getenv("METASTORE_DB", 'META_MART')
 METASTORE_DB_USER = os.getenv("METASTORE_DB_USER", RDBMS_USER)
 METASTORE_DB_PASSWORD = os.getenv("METASTORE_DB_PASSWORD", RDBMS_PASSWORD)
 METASTORE_DB_SCHEMA = os.getenv("METASTORE_DB_SCHEMA", 'metastore')
+METASTORE_URI = os.getenv("METASTORE_URI", "thrift://hive-metastore:9083")
 
 
 PROCESSING_MODE = os.getenv("PROCESSING_MODE", "streaming")
@@ -70,7 +79,3 @@ DBT_PROFILES_DIR = os.path.join(os.path.dirname(__file__), "profiles")
 DBT_MODELS_JSON_DIR = os.path.join(os.path.dirname(__file__), "models", "json")
 DBT_MODELS_SQL_DIR = os.path.join(os.path.dirname(__file__), "models", "sql")
 
-# Thift Connection
-THRIFT_HOST = os.getenv("THRIFT_HOST", "localhost")
-THRIFT_PORT = int(os.getenv("THRIFT_PORT", "7079"))
-THRIFT_AUTH = os.getenv("THRIFT_AUTH", "NOSASL")
