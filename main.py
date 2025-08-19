@@ -5,33 +5,30 @@ import time
 import threading
 import pandas as pd
 import yaml
+from jinja2 import Template
 from pyhive import hive
 from cdc_kafka_producer import cdc_producer_insert_only
 from config import (
     LAKE_TYPE, PARQUET_PATH,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
-    RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, THRIFT_AUTH, DBT_MODELS_SQL_DIR
+    RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, THRIFT_AUTH, DBT_MODELS_SQL_DIR,
+    STAGING_SCHEMA,
 )
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
-from utils import get_spark_session
+from utils.bronze_ingestor import start_bronze_writer, materialize_bronze_accounts_from_postgres
+from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir
 from logger import log
-
-# Directory where JSON model descriptions will be written
-# (configured via DBT_MODELS_JSON_DIR in config.py)
-WATERMARK_FILE = "cdc_watermarks.json"
 
 def _resolve_thrift(target_cfg):
     """Resolve Hive Thrift connection parameters with env taking precedence."""
     env_host = os.environ.get("THRIFT_HOST")
     env_port = os.environ.get("THRIFT_PORT")
-    env_auth = os.environ.get("THRIFT_AUTH")
     host = env_host or target_cfg.get("host") or THRIFT_HOST
     port = int(env_port or target_cfg.get("port") or THRIFT_PORT)
-    auth = env_auth or THRIFT_AUTH
     user = target_cfg.get("user")
-    log.debug(f"Using Hive Thrift server host={host}, port={port}, auth={auth}")
-    return host, port, user, auth
+    log.debug(f"Using Hive Thrift server host={host}, port={port}")
+    return host, port, user
 
 def discover_lake():
     """Return available lake tables and a loader function."""
@@ -73,6 +70,18 @@ def discover_lake():
     log.info(f"Discovered {len(tables)} table(s) in {LAKE_TYPE} lake")
     return tables, load_table
 
+
+# def ensure_database_schema_pg(spark, db_name: str, location: str | None = None, use_after_create: bool = True) -> None:
+#     """
+#     Ensure a Hive database/schema exists. If `location` is provided, create it at that path.
+#     """
+#     if location:
+#         spark.sql(f"CREATE DATABASE IF NOT EXISTS {db_name} LOCATION '{location}'")
+#     else:
+#         spark.sql(f"CREATE DATABASE IF NOT EXISTS {db_name}")
+#     if use_after_create:
+#         spark.sql(f"USE {db_name}")
+
 def ensure_database_schema():
     """Create target Spark database/schema if it does not exist."""
     profiles_yml_path = os.path.join(DBT_PROFILES_DIR, "profiles.yml")
@@ -87,8 +96,10 @@ def ensure_database_schema():
     schema = target_cfg.get("schema") or target_cfg.get("database")
     if not schema:
         return
-    host, port, user, auth = _resolve_thrift(target_cfg)
-    conn = hive.Connection(host=host, port=port, username=user, auth=auth)
+    if "{{" in schema:
+        schema = Template(schema).render(env_var=lambda name, default=None: os.getenv(name, default))
+    host, port, user = _resolve_thrift(target_cfg)
+    conn = hive.Connection(host=host, port=port, username=user)
     cursor = conn.cursor()
     cursor.execute(f"CREATE DATABASE IF NOT EXISTS {schema}")
     cursor.close()
@@ -110,7 +121,7 @@ def write_sql_model_file(model_name, table_name, model_type, meta):
 
     lines.append("    current_timestamp() as load_datetime,")
     lines.append(f"    '{table_name}' as record_source")
-    lines.append(f"from {{ source('staging', '{table_name}') }}")
+    lines.append(f"from {{{{ source('staging', '{table_name}') }}}}")
 
     if model_type in {"hub", "link"} and business_keys:
         lines.append(f"group by {', '.join(business_keys)}")
@@ -152,6 +163,7 @@ def generate_schema_yml(table_names, output_path="models/schema.yml"):
     lines.append("")
     lines.append("sources:")
     lines.append("  - name: staging")
+    lines.append('    schema: "{{ env_var(\'STAGING_SCHEMA\', \'bronze\') }}"')
     lines.append("    tables:")
     for t in table_names:
         lines.append(f"      - name: {t}")
@@ -227,8 +239,8 @@ def get_raw_vault_tables():
     schema = target_cfg.get("schema") or target_cfg.get("database")
     if not schema:
         return set()
-    host, port, user, auth = _resolve_thrift(target_cfg)
-    conn = hive.Connection(host=host, port=port, username=user, auth=auth)
+    host, port, user = _resolve_thrift(target_cfg)
+    conn = hive.Connection(host=host, port=port, username=user)
     cursor = conn.cursor()
     cursor.execute("SHOW TABLES")
     tables = [row[0] for row in cursor.fetchall()]
@@ -332,6 +344,11 @@ def streaming_dv_consumer_and_dbt():
             log.info(f"[DBT Model] Skipping {table_name}: could not infer schema")
             continue
         df_stream = get_kafka_stream(spark, table_name, schema)
+
+        # NEW: persist streaming data into bronze tables Spark can see
+        start_bronze_writer(spark, table_name, df_stream)
+
+        # Existing: build DV models off this table’s metadata
         meta = extract_metadata(table_name, df_stream)
         hubs, links, sats = split_datavault(table_name, meta)
 
@@ -366,15 +383,38 @@ def streaming_dv_consumer_and_dbt():
         log.critical(f"dbt run failed with exit code {exit_code}")
         raise RuntimeError(f"dbt run failed with exit code {exit_code}")
     log.info("dbt run completed successfully")
+    log.info("Streaming ingestion to bronze is running. Press Ctrl+C to stop.")
+    spark.streams.awaitAnyTermination()
 
 
 
 def main():
     os.makedirs(DBT_MODELS_JSON_DIR, exist_ok=True)
+    ensure_spark_warehouse_dir()
     ensure_profiles_dir()
     ensure_database_schema()
 
+    # 1) Discover tables in the source lake (Postgres)
     lake_tables, load_table = discover_lake()
+
+    # 2) PRE-MATERIALIZE bronze tables so dbt can read them
+    spark = get_spark_session("Bronze_Seeder")
+    for t in lake_tables:
+        materialize_bronze_accounts_from_postgres(
+            spark,
+            host=RDBMS_HOST,
+            port=RDBMS_PORT,
+            db=RDBMS_DB,
+            user=RDBMS_USER,
+            password=RDBMS_PASSWORD,
+            schema=RDBMS_SCHEMA,
+            source_table=t,
+            target_db=STAGING_SCHEMA,
+            target_table=t,
+            mode="overwrite",
+        )
+
+    # 3) (re)generate sources + models
     generate_schema_yml(lake_tables)
     existing_models = get_existing_model_tables()
     vault_tables = get_raw_vault_tables()
@@ -408,6 +448,7 @@ def main():
 
     try:
         streaming_dv_consumer_and_dbt()
+
     except KeyboardInterrupt:
         log.info("Shutting down CDC producer...")
         stop_event.set()
