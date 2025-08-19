@@ -1,18 +1,20 @@
-# Insert your dbt profile config here
 default:
   target: dev
   outputs:
     dev:
       type: spark
       method: thrift
-      schema: default
-
-
-      #optional
-      # host: datavault-ingestion-spark-thrift    # docker
-      host: host.docker.internal      # local
-      port: 7079
-      user: dbt
-      threads: 3
-      server_side_parameters:
-        "spark.driver.memory": "4g"
+      host: "{{ env_var('THRIFT_HOST', 'localhost') }}"
+      port: "{{ env_var('THRIFT_PORT', '10000') | int  }}"
+      user: "{{ env_var('USER', 'dbt') }}"
+      # auth: "{{ env_var('THRIFT_AUTH', 'NOSASL') }}"
+      schema: "{{ env_var('RAW_VAULT_SCHEMA', 'raw_vault') }}"
+      connect_retries: 5
+      connect_timeout: 10
+      retries: 3
+      threads: 4
+      spark_conf:
+        hive.metastore.uris: "{{ env_var('HMS_URI', 'thrift://host.docker.internal:10000') }}"
+        spark.sql.catalogImplementation: "hive"
+        spark.sql.warehouse.dir: "{{ env_var('SPARK_WAREHOUSE_DIR', '/data/warehouse') }}"
+        hive.metastore.warehouse.dir: "{{ env_var('SPARK_WAREHOUSE_DIR', '/data/warehouse') }}"
