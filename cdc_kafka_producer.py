@@ -1,12 +1,14 @@
-import os
 import json
+import os
 import time
+
 import pandas as pd
 import psycopg2
-from psycopg2 import sql
 from kafka import KafkaProducer
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import TopicAlreadyExistsError
+from logger import log
+from psycopg2 import sql
 
 from config import (
     LAKE_TYPE, PARQUET_PATH,
@@ -14,16 +16,16 @@ from config import (
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC,
 )
 
-from logger import log
 WATERMARK_FILE = "cdc_watermarks.json"
+
 
 # --- Kafka topic management ---
 def check_and_create_topic(
-    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-    topic_name=KAFKA_TOPIC,
-    num_partitions=1,
-    replication_factor=1,
-    timeout_sec=30
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        topic_name=KAFKA_TOPIC,
+        num_partitions=1,
+        replication_factor=1,
+        timeout_sec=30
 ):
     """
     Ensures a Kafka topic exists and waits until at least one partition is available.
@@ -59,14 +61,18 @@ def check_and_create_topic(
         time.sleep(1)
         if time.time() - start > timeout_sec:
             log.critical(f"[Kafka] Timeout: Topic '{topic_name}' does not have partitions after {timeout_sec} seconds.")
-            raise TimeoutError(f"[Kafka] Timeout: Topic '{topic_name}' does not have partitions after {timeout_sec} seconds.")
+            raise TimeoutError(
+                f"[Kafka] Timeout: Topic '{topic_name}' does not have partitions after {timeout_sec} seconds.")
+
 
 # Parquet helpers
 def get_parquet_tables():
     return [f[:-8] for f in os.listdir(PARQUET_PATH) if f.endswith(".parquet")]
 
+
 def load_parquet_table(table_name):
     return pd.read_parquet(os.path.join(PARQUET_PATH, table_name + ".parquet"))
+
 
 # RDBMS helpers
 def get_rdbms_tables():
@@ -83,6 +89,7 @@ def get_rdbms_tables():
     cur.close()
     conn.close()
     return tables
+
 
 def load_rdbms_table(table_name):
     conn = psycopg2.connect(
@@ -102,6 +109,7 @@ def load_rdbms_table(table_name):
     conn.close()
     df = pd.DataFrame(data, columns=colnames)
     return df
+
 
 def load_watermarks():
     if os.path.exists(WATERMARK_FILE):
@@ -127,6 +135,7 @@ def load_watermarks():
     log.info("No watermark file found; starting fresh")
     return {}
 
+
 def save_watermarks(wm):
     serializable = {}
     for tbl, ts in wm.items():
@@ -135,6 +144,7 @@ def save_watermarks(wm):
         serializable[tbl] = str(ts)
     with open(WATERMARK_FILE, "w") as f:
         json.dump(serializable, f)
+
 
 def produce_tables_once(tables):
     """Produce all rows for the given tables exactly once."""
@@ -190,6 +200,7 @@ def produce_tables_once(tables):
     producer.flush()
     save_watermarks(watermarks)
     producer.close()
+
 
 def cdc_producer_insert_only():
     # Ensure topic exists and is ready
@@ -252,6 +263,7 @@ def cdc_producer_insert_only():
         producer.flush()
         save_watermarks(watermarks)
         time.sleep(5)
+
 
 if __name__ == "__main__":
     cdc_producer_insert_only()
