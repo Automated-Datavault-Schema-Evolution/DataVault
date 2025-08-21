@@ -20,7 +20,9 @@ from config import (
     SPARK_KRYO_BUFFER_MAX,
     SPARK_ADAPTIVE_EXECUTION,
     SPARK_DYNAMIC_SHUFFLE_TRACKING,
-    HOST_SPARK_WAREHOUSE_DIR, METASTORE_URI, CONTAINER_SPARK_WAREHOUSE_DIR,
+    METASTORE_URI,
+    CONTAINER_SPARK_WAREHOUSE_DIR,
+    HOST_SPARK_WAREHOUSE_DIR,
 )
 
 
@@ -43,6 +45,7 @@ def ensure_spark_warehouse_dir():
     except Exception as e:
         log.critical(f"Cannot create warehouse dir {path}: {e}")
         raise RuntimeError(f"Cannot create warehouse dir {path}: {e}")
+
 
 def get_spark_session(app_name="Kafka_Consumer_Lake_Handler"):
     ensure_spark_warehouse_dir()
@@ -83,7 +86,6 @@ def get_spark_session(app_name="Kafka_Consumer_Lake_Handler"):
         .config("spark.sql.warehouse.dir", CONTAINER_SPARK_WAREHOUSE_DIR) \
         .config("spark.hadoop.hive.metastore.uris", METASTORE_URI) \
         .config("spark.sql.catalogImplementation", "hive")
-        # .config("hive.metastore.uris", METASTORE_URI) \
     my_packages = [
         "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.6",
         "org.apache.kafka:kafka-clients:3.5.1",
