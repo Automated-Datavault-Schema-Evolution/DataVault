@@ -1,8 +1,11 @@
 import os
 
+from logger import log
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import current_timestamp, lit
-from logger import log
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+
 from config import STAGING_SCHEMA
 
 
@@ -10,84 +13,118 @@ def _ensure_db(spark: SparkSession):
     spark.sql(f"CREATE DATABASE IF NOT EXISTS {STAGING_SCHEMA}")
 
 
+def ensure_bronze_table_exists(spark: SparkSession, table_name: str, schema) -> bool:
+    """
+    Create an EMPTY managed table bronze.<table_name> with the provided schema if it doesn't exist.
+    Returns True if created, False if it already existed.
+    """
+    _ensure_db(spark)
+    fq = f"{STAGING_SCHEMA}.{table_name}"
+    if spark.catalog.tableExists(fq):
+        return False
+    empty_df = spark.createDataFrame(spark.sparkContext.emptyRDD(), schema)
+    # 'overwrite' to guarantee creation; table does not exist yet
+    empty_df.write.mode("overwrite").saveAsTable(fq)
+    log.info("[BRONZE] Precreated empty table %s", fq)
+    return True
+
+
+def truncate_bronze_table(spark: SparkSession, table_name: str) -> None:
+    """
+    Always truncate bronze after ingestion — but only if the table exists.
+    (dbt might run before the first micro-batch; don't error out.)
+    """
+    _ensure_db(spark)
+    fq = f"{STAGING_SCHEMA}.{table_name}"
+    if not spark.catalog.tableExists(fq):
+        log.info("[BRONZE] Table %s not found; skipping truncate", fq)
+        return
+    spark.sql(f"TRUNCATE TABLE {fq}")
+    log.info("[BRONZE] Truncated %s", fq)
+
 
 def start_bronze_writer(
-    spark: SparkSession,
-    table_name: str,
-    df_stream: DataFrame,
-    checkpoint_base: str = "./checkpoints",
+        spark: SparkSession,
+        table_name: str,
+        df_stream: DataFrame,
+        checkpoint_base: str = "./data/checkpoints",
+        on_after_write=None
 ):
     """
-    Persist the streaming dataframe to a managed Spark table in the staging (bronze) schema.
+    Persist the streaming dataframe to a managed Spark table in the bronze schema.
     Uses foreachBatch to append micro-batches (engine-agnostic). Adds simple audit cols.
     """
     if df_stream is None:
         log.warning("[BRONZE] No stream for %s; skipping writer", table_name)
         return None
-
     _ensure_db(spark)
+    # Ensure the target table exists BEFORE any dbt run that references it.
+    try:
+        ensure_bronze_table_exists(spark, table_name, df_stream.schema)
+    except Exception as e:
+        log.warning("[BRONZE] Could not precreate %s.%s: %s", STAGING_SCHEMA, table_name, e)
     checkpoint_path = os.path.join(checkpoint_base, "bronze", table_name)
     os.makedirs(checkpoint_path, exist_ok=True)
 
-    def write_batch(batch_df: DataFrame, epoch_id: int):
-        if batch_df.rdd.isEmpty():
+    def write_batch(batch_df, batch_id):
+        if batch_df._jdf.limit(1).count() == 0:
             return
-        out_df = (
-            batch_df.withColumn("__ingested_at", current_timestamp())
-                    .withColumn("__record_source", lit(table_name))
-        )
+
+        out_df = (batch_df
+                  .withColumn("__ingested_at", F.current_timestamp())
+                  .withColumn("__record_source", F.lit("kafka_cdc")))
+
+        ensure_bronze_table_schema(spark, table_name, out_df.schema)
+
+        # ensure column order == table order
+        tbl_cols = spark.table(f"{STAGING_SCHEMA}.{table_name}").columns
+        out_df = out_df.select([F.col(c) for c in tbl_cols])
+
         out_df.write.mode("append").saveAsTable(f"{STAGING_SCHEMA}.{table_name}")
+
+        if on_after_write is not None:
+            try:
+                on_after_write(batch_id)
+            except Exception as e:
+                log.warning("[BRONZE] on_after_write failed for %s (batch %s): %s",
+                            table_name, batch_id, e)
 
     log.info("[BRONZE] Starting writer for %s -> %s.%s", table_name, STAGING_SCHEMA, table_name)
     query = (
         df_stream.writeStream
         .foreachBatch(write_batch)
         .option("checkpointLocation", checkpoint_path)
-        .outputMode("update")
+        .outputMode("append")
         .start()
     )
     return query
 
+_SQL_TYPE = {
+    T.StringType: "STRING",
+    T.IntegerType: "INT",
+    T.LongType: "BIGINT",
+    T.DoubleType: "DOUBLE",
+    T.FloatType: "FLOAT",
+    T.BooleanType: "BOOLEAN",
+    T.TimestampType: "TIMESTAMP",
+    T.DateType: "DATE",
+}
 
-def materialize_bronze_accounts_from_postgres(
-    spark: SparkSession,
-    *,
-    host: str,
-    port: int,
-    db: str,
-    user: str,
-    password: str,
-    schema,
-    source_table,
-    target_db,
-    target_table,
-    mode: str = "overwrite",  # or "append" if you need incremental
-):
-    """
-    Reads the staging RDBMS table and writes it as a Hive managed table bronze.accounts
-    in the current metastore (the one dbt uses via Thrift/HMS).
-    """
-    jdbc_url = f"jdbc:postgresql://{host}:{port}/{db}"
+def _spark_sql_type(dt: T.DataType) -> str:
+    return _SQL_TYPE.get(type(dt), "STRING")  # simple fallback for complex types
 
-    # Ensure we can switch schema explicitly (create in bronze db)
-    spark.sql(f"CREATE DATABASE IF NOT EXISTS {target_db}")
-    spark.sql(f"USE {target_db}")
+def ensure_bronze_table_schema(spark, table_name: str, df_schema: T.StructType):
+    fqtn = f"{STAGING_SCHEMA}.{table_name}"
 
-    # Read from Postgres using Spark JDBC
-    df = (
-        spark.read.format("jdbc")
-        .option("url", jdbc_url)
-        .option("dbtable", f"{schema}.{source_table}")
-        .option("user", user)
-        .option("password", password)
-        .option("driver", "org.postgresql.Driver")
-        .load()
-    )
+    # let first micro-batch create the table with full schema
+    if not spark._jsparkSession.catalog().tableExists(STAGING_SCHEMA, table_name):
+        return
 
-    # Write to Hive managed table bronze.accounts
-    full_table_name = f"{target_db}.{target_table}"
-    df.write.mode(mode).saveAsTable(full_table_name)
+    # find columns missing in the existing table
+    have_cols = {f.name.lower() for f in spark.table(fqtn).schema}
+    missing = [f for f in df_schema if f.name.lower() not in have_cols]
+    if not missing:
+        return
 
-    # A tiny sanity check in logs
-    cnt = spark.table(full_table_name).count()
-    log.debug(f"[BRONZE_INGESTOR] Wrote {cnt} row(s) to {full_table_name}")
+    cols_sql = ", ".join(f"`{f.name}` {_spark_sql_type(f.dataType)}" for f in missing)
+    spark.sql(f"ALTER TABLE {fqtn} ADD COLUMNS ({cols_sql})")
