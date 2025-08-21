@@ -26,17 +26,15 @@ from config import (
 )
 
 
-import shutil
-from pathlib import Path
-from typing import Iterable, Optional
-
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql import functions as F
-from pyspark.sql import types as T
+# TODO: REFACTOR!! --> EITHER DELETE AND ONLY RUN IN DOCKER, OR CHANGE LOGIC FOR DYNAMIC PATHS IN env-file
+def _pick_warehouse_dir() -> Path:
+    is_local = str(SPARK_MASTER).startswith("local") or os.getenv("ENV_TYPE", "local") == "local"
+    base = HOST_SPARK_WAREHOUSE_DIR if is_local else CONTAINER_SPARK_WAREHOUSE_DIR
+    return Path(base).resolve()
 
 def ensure_spark_warehouse_dir():
     """Ensure Spark's warehouse dir exists and is writable."""
-    path = Path(CONTAINER_SPARK_WAREHOUSE_DIR)
+    path = _pick_warehouse_dir()
     try:
         path.mkdir(parents=True, exist_ok=True)
         # Make sure permissions allow Spark to write
