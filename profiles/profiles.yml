@@ -14,7 +14,7 @@ default:
       retries: 3
       threads: 4
       spark_conf:
-        hive.metastore.uris: "{{ env_var('HMS_URI', 'thrift://host.docker.internal:10000') }}"
+        hive.metastore.uris: "{{ env_var('METASTORE_URI', 'thrift://host.docker.internal:9083') }}"
         spark.sql.catalogImplementation: "hive"
-        spark.sql.warehouse.dir: "{{ env_var('SPARK_WAREHOUSE_DIR', '/data/warehouse') }}"
-        hive.metastore.warehouse.dir: "{{ env_var('SPARK_WAREHOUSE_DIR', '/data/warehouse') }}"
+        spark.sql.warehouse.dir: "{{ env_var('CONTAINER_SPARK_WAREHOUSE_DIR', '/data/spark/warehouse') }}"
+        hive.metastore.warehouse.dir: "{{ env_var('CONTAINER_SPARK_WAREHOUSE_DIR', '/data/spark/warehouse') }}"
