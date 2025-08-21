@@ -1,24 +1,56 @@
-import os
-import sys
 import json
-import time
+import os
+import subprocess
 import threading
+
 import pandas as pd
 import yaml
 from jinja2 import Template
+from logger import log
 from pyhive import hive
+
 from cdc_kafka_producer import cdc_producer_insert_only
 from config import (
     LAKE_TYPE, PARQUET_PATH,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
-    RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, THRIFT_AUTH, DBT_MODELS_SQL_DIR,
-    STAGING_SCHEMA,
+    RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, DBT_MODELS_SQL_DIR,
+    KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID,
 )
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
-from utils.bronze_ingestor import start_bronze_writer, materialize_bronze_accounts_from_postgres
+from utils.bronze_ingestor import start_bronze_writer, truncate_bronze_table, ensure_bronze_table_exists
 from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir
-from logger import log
+
+
+def write_text_if_changed(path: str, content: str) -> bool:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            if f.read() == content:
+                return False
+    except FileNotFoundError:
+        pass
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return True
+
+
+def run_dbt_models(models):
+    """Run dbt for the specified models."""
+    if not models:
+        return
+    ensure_profiles_dir()
+    cmd = [
+              "dbt",
+              "run",
+              "--profiles-dir",
+              DBT_PROFILES_DIR,
+              "--select",
+          ] + sorted(models)
+    log.info(f"[DBT] Running: {cmd}")
+    # use check=False to keep app running even if some models fail
+    subprocess.run(cmd, check=False)
+
 
 def _resolve_thrift(target_cfg):
     """Resolve Hive Thrift connection parameters with env taking precedence."""
@@ -30,12 +62,23 @@ def _resolve_thrift(target_cfg):
     log.debug(f"Using Hive Thrift server host={host}, port={port}")
     return host, port, user
 
+
 def discover_lake():
     """Return available lake tables and a loader function."""
     log.debug(f"LAKE_TYPE: {LAKE_TYPE}")
     if LAKE_TYPE == "parquet":
         tables = [f[:-8] for f in os.listdir(PARQUET_PATH) if f.endswith(".parquet")]
-        load_table = lambda t: pd.read_parquet(os.path.join(PARQUET_PATH, t + ".parquet"), nrows=1)
+
+        def load_table(t):
+            path = os.path.join(PARQUET_PATH, t + ".parquet")
+            # read just schema if pyarrow is available; otherwise use head(0)
+            try:
+                import pyarrow.parquet as pq
+                pf = pq.ParquetFile(path)
+                cols = list(pf.schema.names)
+                return pd.DataFrame(columns=cols)
+            except Exception:
+                return pd.read_parquet(path).head(0)
     elif LAKE_TYPE == "rdbms":
         import psycopg2
         from psycopg2 import sql
@@ -58,29 +101,21 @@ def discover_lake():
                 dbname=RDBMS_DB, user=RDBMS_USER, password=RDBMS_PASSWORD
             )
             cur = conn.cursor()
-            q = sql.SQL("SELECT * FROM {}.{} LIMIT 1").format(sql.Identifier(RDBMS_SCHEMA), sql.Identifier(t))
+            q = sql.SQL("SELECT * FROM {}.{} LIMIT 1").format(
+                sql.Identifier(RDBMS_SCHEMA), sql.Identifier(t)
+            )
             cur.execute(q)
-            colnames = [desc[0] for desc in cur.description]
+            cols = [desc[0] for desc in cur.description]
             cur.close()
             conn.close()
-            return pd.DataFrame(columns=colnames)
+            # return a dataframe-like schema descriptor; dv_modeller.extract_metadata handles it
+            return pd.DataFrame(columns=cols)
+
+        return tables, load_table
     else:
-        log.critical(f"Unknown LAKE_TYPE '{LAKE_TYPE}'")
-        raise ValueError("Unknown LAKE_TYPE")
-    log.info(f"Discovered {len(tables)} table(s) in {LAKE_TYPE} lake")
+        raise ValueError(f"Unsupported LAKE_TYPE: {LAKE_TYPE}")
+
     return tables, load_table
-
-
-# def ensure_database_schema_pg(spark, db_name: str, location: str | None = None, use_after_create: bool = True) -> None:
-#     """
-#     Ensure a Hive database/schema exists. If `location` is provided, create it at that path.
-#     """
-#     if location:
-#         spark.sql(f"CREATE DATABASE IF NOT EXISTS {db_name} LOCATION '{location}'")
-#     else:
-#         spark.sql(f"CREATE DATABASE IF NOT EXISTS {db_name}")
-#     if use_after_create:
-#         spark.sql(f"USE {db_name}")
 
 def ensure_database_schema():
     """Create target Spark database/schema if it does not exist."""
@@ -106,8 +141,9 @@ def ensure_database_schema():
     conn.close()
     log.info(f"[DB] Ensured database/schema '{schema}' exists")
 
+
 def write_sql_model_file(model_name, table_name, model_type, meta):
-    """Create a dbt SQL model file based on JSON metadata."""
+    """Create/update a dbt SQL model file based on JSON metadata (idempotent)."""
     os.makedirs(DBT_MODELS_SQL_DIR, exist_ok=True)
     file_path = os.path.join(DBT_MODELS_SQL_DIR, f"{model_name}.sql")
     business_keys = meta.get("business_keys", [])
@@ -115,22 +151,23 @@ def write_sql_model_file(model_name, table_name, model_type, meta):
     columns = business_keys + attributes
 
     lines = ["{{ config(materialized='table') }}", "", "select"]
-
     for col in columns:
         lines.append(f"    {col},")
-
     lines.append("    current_timestamp() as load_datetime,")
     lines.append(f"    '{table_name}' as record_source")
     lines.append(f"from {{{{ source('staging', '{table_name}') }}}}")
-
     if model_type in {"hub", "link"} and business_keys:
         lines.append(f"group by {', '.join(business_keys)}")
 
-    with open(file_path, "w") as f:
-        f.write("\n".join(lines) + "\n")
+    content = "\n".join(lines) + "\n"
+    wrote = write_text_if_changed(file_path, content)
+    if wrote:
+        log.debug(f"[DBT] Wrote SQL model {model_name}.sql")
+    return wrote
+
 
 def write_json_model_file(model_name, table_name, model_type, meta):
-    """Persist model metadata as JSON for dbt-spark."""
+    """Persist model metadata as JSON for dbt-spark (idempotent) and sync SQL."""
     os.makedirs(DBT_MODELS_JSON_DIR, exist_ok=True)
     file_path = os.path.join(DBT_MODELS_JSON_DIR, f"{model_name}.json")
     model_def = {
@@ -141,21 +178,23 @@ def write_json_model_file(model_name, table_name, model_type, meta):
         "attributes": meta.get("attributes", []),
         "columns": meta.get("columns", []),
     }
-    with open(file_path, "w") as file:
-        json.dump(model_def, file, indent=2)
-    write_sql_model_file(model_name, table_name, model_type, model_def)
-    write_metadata(model_def)
-    write_lineage(
-        {
-            "source_table": table_name,
-            "target_model": model_name,
-            "model_type": model_type,
-            "business_keys": meta.get("business_keys", []),
-            "attributes": meta.get("attributes", []),
-            "columns": meta.get("columns", []),
-        }
-    )
-    log.info(f"[GEN] Generated DBT JSON model for {model_name} (from lake table {table_name})")
+    json_txt = json.dumps(model_def, indent=2) + "\n"
+    wrote_json = write_text_if_changed(file_path, json_txt)
+    wrote_sql = write_sql_model_file(model_name, table_name, model_type, model_def)
+    if wrote_json or wrote_sql:
+        write_metadata(model_def)
+        write_lineage(
+            {
+                "source_table": table_name,
+                "target_model": model_name,
+                "model_type": model_type,
+                "business_keys": model_def["business_keys"],
+                "attributes": model_def["attributes"],
+                "columns": model_def["columns"],
+            }
+        )
+        log.info(f"[GEN] Generated/updated DBT JSON model for {model_name} (from lake table {table_name})")
+
 
 def generate_schema_yml(table_names, output_path="models/schema.yml"):
     lines = []
@@ -167,18 +206,18 @@ def generate_schema_yml(table_names, output_path="models/schema.yml"):
     lines.append("    tables:")
     for t in table_names:
         lines.append(f"      - name: {t}")
-    with open(output_path, "w") as f:
-        f.write("\n".join(lines))
+    write_text_if_changed(output_path, "\n".join(lines) + "\n")
+
 
 def ensure_dbt_models_for_lake(tables, load_table):
-    # Generate JSON model metadata for each lake table
+    """Generate JSON/SQL model metadata for each lake table (idempotent)."""
     new_models = []
     for table in tables:
         df_schema = load_table(table)
         meta = extract_metadata(table, df_schema)
         hubs, links, sats = split_datavault(table, meta)
 
-        # Generate Hubs
+        # Hubs
         for hub in hubs:
             model_name = hub["name"]
             bk = hub["key"]
@@ -187,7 +226,7 @@ def ensure_dbt_models_for_lake(tables, load_table):
             )
             new_models.append(model_name)
 
-        # Generate Links
+        # Links
         for link in links:
             model_name = link["name"]
             keys = link["keys"]
@@ -196,20 +235,20 @@ def ensure_dbt_models_for_lake(tables, load_table):
             )
             new_models.append(model_name)
 
-        # Generate Satellites
+        # Satellites
         for sat in sats:
             model_name = sat["name"]
             keys = sat["key"]
             atts = sat["attributes"]
             write_json_model_file(
-                model_name, table, "sat",
-                {"business_keys": keys, "attributes": atts, "columns": keys + atts},
+                model_name, table, "sat", {"business_keys": keys, "attributes": atts, "columns": keys + atts}
             )
             new_models.append(model_name)
     return new_models
 
+
 def get_existing_model_tables():
-    """Return a mapping of lake tables to their generated model names."""
+    """Return mapping of lake tables to their generated model names (no rewrites)."""
     table_models = {}
     if not os.path.exists(DBT_MODELS_JSON_DIR):
         return table_models
@@ -220,10 +259,9 @@ def get_existing_model_tables():
             data = json.load(f)
         table_name = data.get("table_name")
         model_name = data.get("model_name")
-        model_type = data.get("model_type")
-        write_sql_model_file(model_name, table_name, model_type, data)
         table_models.setdefault(table_name, []).append(model_name)
     return table_models
+
 
 def get_raw_vault_tables():
     """List existing tables in the raw vault."""
@@ -247,6 +285,7 @@ def get_raw_vault_tables():
     cursor.close()
     conn.close()
     return set(tables)
+
 
 def ensure_profiles_dir():
     """
@@ -279,13 +318,15 @@ def get_kafka_stream(spark, table_name, schema):
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
         .option("subscribe", KAFKA_TOPIC)
-        .option("startingOffsets", "latest")
+        .option("startingOffsets", KAFKA_STARTING_OFFSETS)  # earlist for first run, then checkpoint
+        .option("groupIdPrefix", KAFKA_GROUP_ID)
         .load()
     )
     df_json = df.select(from_json(col("value").cast("string"), json_schema).alias("json"))
     df_table = df_json.filter(col("json.table") == table_name)
     df_data = df_table.select(from_json(col("json.payload"), schema).alias("data")).select("data.*")
     return df_data
+
 
 def infer_schema_from_cdc_event(spark, table_name):
     from pyspark.sql.functions import col, from_json
@@ -311,11 +352,12 @@ def infer_schema_from_cdc_event(spark, table_name):
     if not sample:
         return None
     payload_json = json.loads(sample[0]["json"]["payload"])
+    from pyspark.sql.types import StructField, StringType, StructType
     fields = [StructField(k, StringType(), True) for k in payload_json.keys()]
     return StructType(fields)
 
 
-def streaming_dv_consumer_and_dbt():
+def streaming_dv_consumer_and_dbt(models_to_run):
     spark = get_spark_session("DataVault_Streaming_Consumer")
     from pyspark.sql.functions import col, from_json
     from pyspark.sql.types import StructType, StructField, StringType
@@ -338,32 +380,44 @@ def streaming_dv_consumer_and_dbt():
     table_rows = df_json.groupBy(col("json.table")).count().collect()
     table_names = [row["table"] for row in table_rows if row["table"] is not None]
 
+    queries = []
+    ensured_tables = []
+
+    table_to_models = get_existing_model_tables()
     for table_name in table_names:
         schema = infer_schema_from_cdc_event(spark, table_name)
         if not schema:
             log.info(f"[DBT Model] Skipping {table_name}: could not infer schema")
             continue
+
+        if ensure_bronze_table_exists(spark, table_name, schema):
+            ensured_tables.append(table_name)
+
         df_stream = get_kafka_stream(spark, table_name, schema)
 
-        # NEW: persist streaming data into bronze tables Spark can see
-        start_bronze_writer(spark, table_name, df_stream)
+        # On each micro-batch: run only the model for this table and then truncate bronze.<table>
+        def after_write(_epoch_id: int, _tbl=table_name):
+            models = table_to_models.get(_tbl, [])
+            if models:
+                run_dbt_models(models)
+            truncate_bronze_table(spark, _tbl)
 
-        # Existing: build DV models off this table’s metadata
+        q = start_bronze_writer(spark, table_name, df_stream, on_after_write=after_write)
+        if q:
+            queries.append((table_name, q))
+
         meta = extract_metadata(table_name, df_stream)
         hubs, links, sats = split_datavault(table_name, meta)
-
         for hub in hubs:
             write_json_model_file(
                 hub["name"], table_name, "hub",
                 {"business_keys": hub["key"], "attributes": [], "columns": hub["key"]},
             )
-
         for link in links:
             write_json_model_file(
                 link["name"], table_name, "link",
                 {"business_keys": link["keys"], "attributes": [], "columns": link["keys"]},
             )
-
         for sat in sats:
             write_json_model_file(
                 sat["name"], table_name, "sat",
@@ -375,17 +429,17 @@ def streaming_dv_consumer_and_dbt():
             )
         log.info(f"[DBT Model] Generated metadata for: {table_name}")
 
-    log.info("[DBT] Running all models...")
-    ensure_profiles_dir()
-    ensure_database_schema()
-    exit_code = os.system(f"dbt run --profiles-dir {DBT_PROFILES_DIR}")
-    if exit_code != 0:
-        log.critical(f"dbt run failed with exit code {exit_code}")
-        raise RuntimeError(f"dbt run failed with exit code {exit_code}")
-    log.info("dbt run completed successfully")
-    log.info("Streaming ingestion to bronze is running. Press Ctrl+C to stop.")
-    spark.streams.awaitAnyTermination()
+    if models_to_run:
+        run_dbt_models(models_to_run)
 
+
+    log.info("Streaming ingestion to bronze is running. Press Ctrl+C to stop.")
+    try:
+        spark.streams.awaitAnyTermination()
+    finally:
+        for _tbl, q in queries:
+            q.stop()
+        log.info("[BRONZE] Stopped streaming queries")
 
 
 def main():
@@ -394,27 +448,8 @@ def main():
     ensure_profiles_dir()
     ensure_database_schema()
 
-    # 1) Discover tables in the source lake (Postgres)
     lake_tables, load_table = discover_lake()
 
-    # 2) PRE-MATERIALIZE bronze tables so dbt can read them
-    spark = get_spark_session("Bronze_Seeder")
-    for t in lake_tables:
-        materialize_bronze_accounts_from_postgres(
-            spark,
-            host=RDBMS_HOST,
-            port=RDBMS_PORT,
-            db=RDBMS_DB,
-            user=RDBMS_USER,
-            password=RDBMS_PASSWORD,
-            schema=RDBMS_SCHEMA,
-            source_table=t,
-            target_db=STAGING_SCHEMA,
-            target_table=t,
-            mode="overwrite",
-        )
-
-    # 3) (re)generate sources + models
     generate_schema_yml(lake_tables)
     existing_models = get_existing_model_tables()
     vault_tables = get_raw_vault_tables()
@@ -432,28 +467,29 @@ def main():
                 models_to_run.add(m)
 
     if models_to_run:
-        log.info(f"[DBT] Running dbt for: {sorted(models_to_run)}")
-        os.system(
-            f"dbt run --profiles-dir {DBT_PROFILES_DIR} --select {' '.join(models_to_run)}"
-        )
+        log.info(f"[DBT] Will run for: {sorted(models_to_run)}")
     else:
         log.info("NO new Data Vault tables to create, all up to date")
 
-    if tables_without_models:
-        from cdc_kafka_producer import produce_tables_once
-        produce_tables_once(tables_without_models)
+    # 3) Start CDC producer and streaming consumer
     stop_event = threading.Event()
     cdc_thread = threading.Thread(target=cdc_producer_insert_only, daemon=True)
     cdc_thread.start()
 
     try:
-        streaming_dv_consumer_and_dbt()
+        streaming_dv_consumer_and_dbt(models_to_run)
+    except KeyboardInterrupt:
+        log.info("Shutting down CDC producer.")
+        stop_event.set()
+        cdc_thread.join()
+        log.info("All done.")
 
     except KeyboardInterrupt:
         log.info("Shutting down CDC producer...")
         stop_event.set()
         cdc_thread.join()
         log.info("All done.")
+
 
 if __name__ == "__main__":
     main()
