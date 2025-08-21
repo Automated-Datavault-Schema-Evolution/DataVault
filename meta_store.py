@@ -1,14 +1,14 @@
-from datetime import datetime
+import json
 import os
 import uuid
+from datetime import datetime
 
 import pandas as pd
 import psycopg2
+from logger import log
 from psycopg2 import sql
 from psycopg2.pool import SimpleConnectionPool
-import json
 
-from logger import log
 from config import (
     LAKE_TYPE,
     METADATA_LINEAGE_PATH,
@@ -27,7 +27,6 @@ METASTORE_POOL_MIN = int(os.getenv("METASTORE_POOL_MIN", 1))
 METASTORE_POOL_MAX = int(os.getenv("METASTORE_POOL_MAX", 5))
 
 
-
 def _append_parquet(row, path):
     if os.path.exists(path):
         df = pd.read_parquet(path)
@@ -35,6 +34,7 @@ def _append_parquet(row, path):
     else:
         df = row
     df.to_parquet(path, index=False)
+
 
 def _ensure_metastore_db():
     """Ensure that the metastore database exists."""
@@ -65,7 +65,7 @@ def _ensure_metastore_db():
             bootstrap_conn.autocommit = True
             with bootstrap_conn.cursor() as cur:
                 cur.execute(
-                    sql.SQL("CREATE DATABASE {}" ).format(
+                    sql.SQL("CREATE DATABASE {}").format(
                         sql.Identifier(METASTORE_DB)
                     )
                 )
@@ -162,7 +162,7 @@ def _append_db(data, table):
             # Ensure schema and target table exist. Each record is stored as
             # JSONB to keep the schema flexible.
             cur.execute(
-                sql.SQL("CREATE SCHEMA IF NOT EXISTS {}" ).format(
+                sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
                     sql.Identifier(METASTORE_DB_SCHEMA)
                 )
             )
@@ -190,6 +190,7 @@ def _append_db(data, table):
     finally:
         if conn:
             release_metastore_connection(conn)
+
 
 def write_lineage(metadata_dict):
     """Append lineage information to the lineage metastore."""
