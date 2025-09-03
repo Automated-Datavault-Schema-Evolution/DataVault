@@ -21,15 +21,15 @@ from config import (
     SPARK_ADAPTIVE_EXECUTION,
     SPARK_DYNAMIC_SHUFFLE_TRACKING,
     METASTORE_URI,
-    CONTAINER_SPARK_WAREHOUSE_DIR,
-    HOST_SPARK_WAREHOUSE_DIR,
+    CONTAINER_WAREHOUSE_DIR,
+    HOST_SPARK_WAREHOUSE_DIR, SPARK_SQL_ADAPTIVE_COALESCE_PARTITIONS, SPARK_SQL_ADAPTIVE_ADVISORY_PARTITION_SIZE,
 )
 
 
 # TODO: REFACTOR!! --> EITHER DELETE AND ONLY RUN IN DOCKER, OR CHANGE LOGIC FOR DYNAMIC PATHS IN env-file
 def _pick_warehouse_dir() -> Path:
     is_local = str(SPARK_MASTER).startswith("local") or os.getenv("ENV_TYPE", "local") == "local"
-    base = HOST_SPARK_WAREHOUSE_DIR if is_local else CONTAINER_SPARK_WAREHOUSE_DIR
+    base = HOST_SPARK_WAREHOUSE_DIR if is_local else CONTAINER_WAREHOUSE_DIR
     return Path(base).resolve()
 
 def ensure_spark_warehouse_dir():
@@ -64,6 +64,9 @@ def get_spark_session(app_name="Kafka_Consumer_Lake_Handler"):
         .config("spark.serializer", SPARK_SERIALIZER)
         .config("spark.kryoserializer.buffer.max", SPARK_KRYO_BUFFER_MAX)
         .config("spark.sql.adaptive.enabled", str(SPARK_ADAPTIVE_EXECUTION).lower())
+        .config("spark.sql.adaptive.coalescePartitions.enabled", str(SPARK_SQL_ADAPTIVE_COALESCE_PARTITIONS).lower())
+        .config("spark.sql.adaptive.advisoryPartitionSizeInBytes",
+                SPARK_SQL_ADAPTIVE_ADVISORY_PARTITION_SIZE)
     )
 
     if SPARK_DYNAMIC_ALLOCATION:
