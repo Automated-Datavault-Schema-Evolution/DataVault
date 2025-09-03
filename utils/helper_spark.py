@@ -47,6 +47,7 @@ def ensure_spark_warehouse_dir():
 
 def get_spark_session(app_name="Kafka_Consumer_Lake_Handler"):
     ensure_spark_warehouse_dir()
+    warehouse_dir = str(_pick_warehouse_dir())
     spark_master = SPARK_MASTER
     log.info(f"Initializing Spark session '{app_name}' on master '{spark_master}'")
     builder = (
@@ -78,12 +79,15 @@ def get_spark_session(app_name="Kafka_Consumer_Lake_Handler"):
     python_exec = sys.executable
     os.environ.setdefault("PYSPARK_PYTHON", python_exec)
     os.environ.setdefault("PYSPARK_DRIVER_PYTHON", python_exec)
-    builder = builder.config("spark.pyspark.python", python_exec) \
-        .config("spark.pyspark.driver.python", python_exec) \
-        .config("spark.sql.streaming.kafka.useUninterruptibleThread", "true") \
-        .config("spark.sql.warehouse.dir", CONTAINER_SPARK_WAREHOUSE_DIR) \
-        .config("spark.hadoop.hive.metastore.uris", METASTORE_URI) \
-        .config("spark.sql.catalogImplementation", "hive")
+    builder = (builder
+            .config("spark.pyspark.python", python_exec)
+            .config("spark.pyspark.driver.python", python_exec)
+            .config("spark.sql.streaming.kafka.useUninterruptibleThread", "true")
+            .config("spark.sql.warehouse.dir", warehouse_dir)
+            .config("spark.hadoop.hive.metastore.uris", METASTORE_URI)
+            .config("spark.sql.catalogImplementation", "hive")
+            .config("spark.sql.legacy.allowCreatingManagedTableUsingExistingLocation", "true")
+    )
     my_packages = [
         "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.6",
         "org.apache.kafka:kafka-clients:3.5.1",
