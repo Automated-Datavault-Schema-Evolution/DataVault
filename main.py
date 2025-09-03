@@ -9,7 +9,7 @@ from jinja2 import Template
 from logger import log
 from pyhive import hive
 
-from cdc_kafka_producer import cdc_producer_insert_only
+from cdc_kafka_producer import cdc_producer_insert_only, produce_tables_once
 from config import (
     LAKE_TYPE, PARQUET_PATH,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
@@ -436,9 +436,14 @@ def streaming_dv_consumer_and_dbt(models_to_run):
             )
         log.info(f"[DBT Model] Generated metadata for: {table_name}")
 
-    if models_to_run:
+    # if models_to_run:
+    #     run_dbt_models(models_to_run)
+    # Only run the initial dbt set if at least one Bronze table is present
+    if models_to_run and ensured_tables:
         run_dbt_models(models_to_run)
-
+    else:
+        if models_to_run:
+            log.info("[DBT] Skipping initial run; Bronze not ready yet. Models will run after first micro-batches.")
 
     log.info("Streaming ingestion to bronze is running. Press Ctrl+C to stop.")
     try:
@@ -448,6 +453,20 @@ def streaming_dv_consumer_and_dbt(models_to_run):
             q.stop()
         log.info("[BRONZE] Stopped streaming queries")
 
+def bootstrap_bronze(lake_tables, load_table):
+    from pyspark.sql.types import StructType, StructField, StringType
+    spark = get_spark_session("DataVault_Bootstrap")
+
+    for t in lake_tables:
+        # Get column names from the lake; make a simple all-STRING schema for the empty Bronze
+        df_cols = list(load_table(t).columns)  # returns a pandas df with just columns for RDBMS/parquet loaders
+        if not df_cols:
+            continue
+        schema = StructType([StructField(c, StringType(), True) for c in df_cols])
+        try:
+            ensure_bronze_table_exists(spark, t, schema)
+        except Exception as e:
+            log.warning(f"[Bootstrap] Could not precreate bronze.{t}: {e}")
 
 def main():
     os.makedirs(DBT_MODELS_JSON_DIR, exist_ok=True)
@@ -457,28 +476,55 @@ def main():
 
     lake_tables, load_table = discover_lake()
 
+    bootstrap_bronze(lake_tables, load_table)
+
     generate_schema_yml(lake_tables)
     existing_models = get_existing_model_tables()
     vault_tables = get_raw_vault_tables()
 
+    # 1) Determine which tables are new (no model yet) and which vault objects are missing
     tables_without_models = [t for t in lake_tables if t not in existing_models]
     models_to_run = set()
+    tables_needing_initial_load = set()
 
     if tables_without_models:
+        # Generate models for new tables
         new_models = ensure_dbt_models_for_lake(tables_without_models, load_table)
         models_to_run.update(new_models)
+        # all new tables will need an initial full load after objects are created
+        tables_needing_initial_load.update(tables_without_models)
 
+    # If any model exists but the physical table is missing in the vault, we must create it
     for table, model_names in existing_models.items():
         for m in model_names:
             if m not in vault_tables:
                 models_to_run.add(m)
+                # this lake table is missing at least one DV object -> full load needed
+                tables_needing_initial_load.add(table)
 
     if models_to_run:
         log.info(f"[DBT] Will run for: {sorted(models_to_run)}")
     else:
         log.info("NO new Data Vault tables to create, all up to date")
 
-    # 3) Start CDC producer and streaming consumer
+    # 2) If we have models to create, do that first
+    if models_to_run:
+        run_dbt_models(sorted(models_to_run))
+
+    # 3) INITIAL FULL LOAD for any lake tables whose DV objects were just created
+    if tables_needing_initial_load:
+        log.info(f"[INITIAL LOAD] Producing full load for tables: {sorted(tables_needing_initial_load)}]")
+        # Produce once: this pushes all historical rows (by table) to Kafka
+        produce_tables_once(sorted(tables_needing_initial_load))
+        log.info("[INITIAL LOAD] Full load events produced")
+
+    # One-shot initial load so the writer has data to land and dbt can build from Bronze
+    try:
+        produce_tables_once(lake_tables)
+    except Exception as e:
+        log.warning(f"[Bootstrap] Initial produce failed (continuing with streaming CDC): {e}")
+
+    # 4) Start CDC producer and streaming consumer
     stop_event = threading.Event()
     cdc_thread = threading.Thread(target=cdc_producer_insert_only, daemon=True)
     cdc_thread.start()
