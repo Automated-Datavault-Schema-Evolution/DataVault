@@ -150,7 +150,14 @@ def write_sql_model_file(model_name, table_name, model_type, meta):
     attributes = meta.get("attributes", [])
     columns = business_keys + attributes
 
-    lines = ["{{ config(materialized='table') }}", "", "select"]
+    incremental_conf = (
+        "{{ config(\n"
+        "    materialized='incremental',\n"
+        "    incremental_strategy='insert_overwrite',\n"
+        "    on_schema_change='sync_all_columns'\n"
+        ") }}\n"
+    )
+    lines = [incremental_conf, "select"]
     for col in columns:
         lines.append(f"    {col},")
     lines.append("    current_timestamp() as load_datetime,")
