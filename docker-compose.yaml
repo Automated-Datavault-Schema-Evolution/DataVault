@@ -133,18 +133,20 @@ services:
       hive-jars-init:
         condition: service_started
     environment:
+      - SPARK_MODE=worker
       - SPARK_WORKER_CORES=2
       - SPARK_WORKER_MEMORY=4g
       - SPARK_WORKER_PORT=18081
-      - SPARK_MASTER=spark://datavault-ingestion-spark-master:7078
+      - SPARK_WORKER_WEBUI_PORT=18082
+      - SPARK_MASTER_URL=spark://datavault-ingestion-spark-master:7078
     volumes:
       - ${HOST_DATA_DIRECTORY}:${CONTAINER_DATA_DIR}
       - hive-313-jars:/opt/hive-3.1.3-lib:ro
       - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
-    ports: [ "18081:18081" ]
+    ports: [ "18082:18082" ]
     networks: [ data-automation-net ]
     healthcheck:
-      test: [ "CMD-SHELL", "curl -fsS http://localhost:18081/ > /dev/null || exit 1" ]
+      test: [ "CMD-SHELL", "curl -fsS http://localhost:18082/ > /dev/null || exit 1" ]
       interval: 5s
       timeout: 5s
       retries: 20
