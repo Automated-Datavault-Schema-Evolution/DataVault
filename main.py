@@ -537,12 +537,5 @@ def main():
         cdc_thread.join()
         log.info("All done.")
 
-    except KeyboardInterrupt:
-        log.info("Shutting down CDC producer...")
-        stop_event.set()
-        cdc_thread.join()
-        log.info("All done.")
-
-
 if __name__ == "__main__":
     main()
