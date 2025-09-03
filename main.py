@@ -20,6 +20,7 @@ from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
 from utils.bronze_ingestor import start_bronze_writer, truncate_bronze_table, ensure_bronze_table_exists
 from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir
+from utils.schema_helpers import bronze_target_columns
 
 
 def write_text_if_changed(path: str, content: str) -> bool:
@@ -407,7 +408,7 @@ def streaming_dv_consumer_and_dbt(models_to_run):
             models = table_to_models.get(_tbl, [])
             if models:
                 run_dbt_models(models)
-            truncate_bronze_table(spark, _tbl)
+            # truncate_bronze_table(spark, _tbl)
 
         q = start_bronze_writer(spark, table_name, df_stream, on_after_write=after_write)
         if q:
@@ -459,7 +460,8 @@ def bootstrap_bronze(lake_tables, load_table):
 
     for t in lake_tables:
         # Get column names from the lake; make a simple all-STRING schema for the empty Bronze
-        df_cols = list(load_table(t).columns)  # returns a pandas df with just columns for RDBMS/parquet loaders
+        # df_cols = list(load_table(t).columns)  # returns a pandas df with just columns for RDBMS/parquet loaders
+        df_cols = bronze_target_columns(spark, t)
         if not df_cols:
             continue
         schema = StructType([StructField(c, StringType(), True) for c in df_cols])

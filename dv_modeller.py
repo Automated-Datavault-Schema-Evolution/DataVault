@@ -2,7 +2,7 @@ import re
 from logger import log
 
 KEY_SUFFIXES = ["id", "nr", "key", "number"]
-
+TECH_COLS = {"modified_at", "__ingested_at", "__record_source"}
 
 def _normalize(name: str) -> str:
     """Normalize a column name for comparison."""
@@ -50,7 +50,7 @@ def extract_metadata(table_name, df):
     else:
         log.warning(f"No hub key detected for table '{table_name}'")
     foreign_keys = [c for c in key_candidates if c != hub_key]
-    attributes = [c for c in cols if c not in key_candidates]
+    attributes = [c for c in cols if c not in key_candidates and c not in TECH_COLS]
     metadata = {
         "columns": cols,
         "business_keys": [hub_key] + foreign_keys if hub_key else foreign_keys,

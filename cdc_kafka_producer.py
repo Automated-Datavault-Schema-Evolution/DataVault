@@ -15,9 +15,17 @@ from config import (
     RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER, RDBMS_PASSWORD, RDBMS_SCHEMA,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC,
 )
+from utils.helper_spark import get_spark_session
+from utils.schema_helpers import introspect_lake_columns
 
 WATERMARK_FILE = "cdc_watermarks.json"
 
+def build_initial_load_sql(table: str) -> str:
+    # Use only real columns from the lake
+    spark = get_spark_session()
+    cols = introspect_lake_columns(spark, table)  # e.g., ['accountid', ...]
+    col_list = ", ".join([f'"{c}"' for c in cols])  # quote for safety
+    return f'SELECT {col_list} FROM "{RDBMS_SCHEMA}"."{table}"'
 
 # --- Kafka topic management ---
 def check_and_create_topic(

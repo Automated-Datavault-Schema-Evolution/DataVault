@@ -13,3 +13,13 @@ snapshot-paths: ["snapshots"]
 
 target-path: "target"
 clean-targets: ["target", "dbt_packages"]
+
+models:
+  automated_datavault:
+    # Prevent Spark from attempting to drop columns on schema changes
+    +on_schema_change: ignore
+    # If you want dbt to add new columns automatically instead, use:
+    # +on_schema_change: append_new_columns
+
+    +materialized: incremental
+    +incremental_strategy: append

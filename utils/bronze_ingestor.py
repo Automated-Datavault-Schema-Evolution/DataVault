@@ -7,6 +7,7 @@ from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
 from config import STAGING_SCHEMA
+from utils.schema_helpers import align_to_columns, bronze_target_columns
 
 
 def _ensure_db(spark: SparkSession):
@@ -63,31 +64,39 @@ def start_bronze_writer(
         ensure_bronze_table_exists(spark, table_name, df_stream.schema)
     except Exception as e:
         log.warning("[BRONZE] Could not precreate %s.%s: %s", STAGING_SCHEMA, table_name, e)
-    checkpoint_path = os.path.join(checkpoint_base, "bronze", table_name)
+    checkpoint_path = os.path.join(checkpoint_base, STAGING_SCHEMA, table_name)
     os.makedirs(checkpoint_path, exist_ok=True)
 
-    def write_batch(batch_df, batch_id):
-        if batch_df._jdf.limit(1).count() == 0:
+    def write_batch(batch_df: DataFrame, batch_id: int):
+        # Fast empty-batch check
+        if batch_df.limit(1).count() == 0:
             return
 
-        out_df = (batch_df
+        # 1) Align to expected business columns (no control cols yet)
+        expected = bronze_target_columns(spark, table_name)  # returns only data/business columns
+        out_df = align_to_columns(batch_df, expected)  # keep_extra defaults to False
+
+        # 2) Add control columns AFTER alignment
+        out_df = (out_df
                   .withColumn("__ingested_at", F.current_timestamp())
                   .withColumn("__record_source", F.lit("kafka_cdc")))
 
+        # 3) Final order (business + control at the end)
+        out_df = out_df.select(*expected, "__ingested_at", "__record_source")
+
+        # 4) Ensure table can accept this schema (adds missing columns if needed)
         ensure_bronze_table_schema(spark, table_name, out_df.schema)
 
-        # ensure column order == table order
-        tbl_cols = spark.table(f"{STAGING_SCHEMA}.{table_name}").columns
-        out_df = out_df.select([F.col(c) for c in tbl_cols])
-
+        # 5) Append
         out_df.write.mode("append").saveAsTable(f"{STAGING_SCHEMA}.{table_name}")
 
+        # Optional callback
         if on_after_write is not None:
             try:
                 on_after_write(batch_id)
             except Exception as e:
-                log.warning("[BRONZE] on_after_write failed for %s (batch %s): %s",
-                            table_name, batch_id, e)
+                log.warning("[BRONZE] on_after_write failed for %s (batch %s): %s", table_name, batch_id, e)
+
 
     log.info("[BRONZE] Starting writer for %s -> %s.%s", table_name, STAGING_SCHEMA, table_name)
     query = (
