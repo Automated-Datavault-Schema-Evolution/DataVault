@@ -16,7 +16,7 @@ services:
       - ${HOST_DATA_DIRECTORY}:${CONTAINER_DATA_DIR}
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
-      - data_automation-net
+      - data-automation-net
     environment:
       - SSH_AUTH_SOCK=/ssh-agent
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092 #change hardcoded variable, to dynamic from env-file (currently hardcoded, as it would use localhost:9092 in docker)
@@ -49,7 +49,7 @@ services:
       - "7078:7078"
       - "8081:8081"
       - "4041:4041"
-    networks: [ data_automation-net ]
+    networks: [ data-automation-net ]
     restart: unless-stopped
     healthcheck:
       test: [ "CMD-SHELL", "curl -fsS http://localhost:8081/ > /dev/null || exit 1" ]
@@ -79,7 +79,7 @@ services:
       - hive-313-jars:/opt/hive-3.1.3-lib:ro
       - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
     ports: [ "8084:8084" ]
-    networks: [ data_automation-net ]
+    networks: [ data-automation-net ]
     healthcheck:
       test: [ "CMD-SHELL", "curl -fsS http://localhost:8084/ > /dev/null || exit 1" ]
       interval: 5s
@@ -115,7 +115,7 @@ services:
       - hive-313-jars:/opt/hive-3.1.3-lib:ro
       - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
     ports: [ "8085:8085" ]
-    networks: [ data_automation-net ]
+    networks: [ data-automation-net ]
     healthcheck:
       test: [ "CMD-SHELL", "curl -fsS http://localhost:8085/ > /dev/null || exit 1" ]
       interval: 5s
@@ -161,7 +161,7 @@ services:
       - hive-313-jars:/opt/hive-3.1.3-lib:ro
       - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
     ports: [ "10000:10000" ]
-    networks: [ data_automation-net ]
+    networks: [ data-automation-net ]
     healthcheck:
       test: [ "CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/10000 && exec 3>&- 3<&- || exit 1'" ]
       interval: 5s
@@ -185,7 +185,7 @@ services:
         sleep infinity
     volumes:
       - hive-313-jars:/hive-jars
-    networks: [ data_automation-net ]
+    networks: [ data-automation-net ]
 
   jdbc-driver-init:
     image: curlimages/curl:8.10.1
@@ -201,7 +201,7 @@ services:
         ls -l /out
     volumes:
       - jdbc-driver:/out
-    networks: [ data_automation-net ]
+    networks: [ data-automation-net ]
 
   metastore-db-init:
     image: postgres:latest
@@ -232,7 +232,7 @@ services:
         psql -Atqc "SELECT 1 FROM pg_database WHERE datname='${METASTORE_DB}'" | grep -q 1 \
           || psql -c "CREATE DATABASE \"${METASTORE_DB}\" OWNER \"${METASTORE_DB_USER}\" ENCODING 'UTF8'";
         psql -d "${METASTORE_DB}" -c "ALTER SCHEMA public OWNER TO \"${METASTORE_DB_USER}\"; GRANT ALL ON SCHEMA public TO \"${METASTORE_DB_USER}\";"
-    networks: [ data_automation-net ]
+    networks: [ data-automation-net ]
     restart: "no"
 
   hive-schema-init:
@@ -257,7 +257,7 @@ services:
     volumes:
       - jdbc-driver:/opt/hive/extra-jars:ro
       - ./hive-site.xml:/opt/hive/conf/hive-site.xml:ro
-    networks: [ data_automation-net ]
+    networks: [ data-automation-net ]
 
   hive-metastore:
     image: apache/hive:3.1.3
@@ -301,7 +301,7 @@ services:
       retries: 30
       start_period: 10s
     ports: [ "9083:9083" ]
-    networks: [ data_automation-net ]
+    networks: [ data-automation-net ]
     restart: unless-stopped
 
 
@@ -313,5 +313,5 @@ volumes:
   jdbc-driver: {}
 
 networks:
-  data_automation-net:
+  data-automation-net:
     external: true
