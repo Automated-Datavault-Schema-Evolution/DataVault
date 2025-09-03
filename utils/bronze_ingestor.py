@@ -70,11 +70,14 @@ def start_bronze_writer(
     def write_batch(batch_df: DataFrame, batch_id: int):
         # Fast empty-batch check
         if batch_df.limit(1).count() == 0:
+            log.info("[BRONZE][%s][batch=%s] Empty micro-batch, nothing to write", table_name, batch_id)
             return
 
         # 1) Align to expected business columns (no control cols yet)
         expected = bronze_target_columns(spark, table_name)  # returns only data/business columns
         out_df = align_to_columns(batch_df, expected)  # keep_extra defaults to False
+
+        in_cnt = batch_df.count()
 
         # 2) Add control columns AFTER alignment
         out_df = (out_df
@@ -88,7 +91,14 @@ def start_bronze_writer(
         ensure_bronze_table_schema(spark, table_name, out_df.schema)
 
         # 5) Append
+        out_cnt = out_df.count()
         out_df.write.mode("append").saveAsTable(f"{STAGING_SCHEMA}.{table_name}")
+
+        total_cnt = spark.table(f"{STAGING_SCHEMA}.{table_name}").count()
+        log.info(
+            "[BRONZE][%s][batch=%s] incoming=%s, written=%s, bronze_total=%s",
+            table_name, batch_id, in_cnt, out_cnt, total_cnt
+        )
 
         # Optional callback
         if on_after_write is not None:

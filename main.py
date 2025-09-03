@@ -14,7 +14,7 @@ from config import (
     LAKE_TYPE, PARQUET_PATH,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
     RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, DBT_MODELS_SQL_DIR,
-    KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID,
+    KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID, STAGING_SCHEMA, RAW_VAULT_SCHEMA,
 )
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
@@ -386,6 +386,11 @@ def streaming_dv_consumer_and_dbt(models_to_run):
     )
     df_json = df.select(from_json(col("value").cast("string"), json_schema).alias("json"))
     table_rows = df_json.groupBy(col("json.table")).count().collect()
+
+    for r in table_rows:
+        if r["table"] is not None:
+            log.info("[KAFKA] table=%s, backlog_messages=%s", r["table"], r["count"])
+
     table_names = [row["table"] for row in table_rows if row["table"] is not None]
 
     queries = []
@@ -404,11 +409,32 @@ def streaming_dv_consumer_and_dbt(models_to_run):
         df_stream = get_kafka_stream(spark, table_name, schema)
 
         # On each micro-batch: run only the model for this table and then truncate bronze.<table>
+        # def after_write(_epoch_id: int, _tbl=table_name):
+        #     models = table_to_models.get(_tbl, [])
+        #     if models:
+        #         run_dbt_models(models)
+        #     # truncate_bronze_table(spark, _tbl)
         def after_write(_epoch_id: int, _tbl=table_name):
+            # 1) show current bronze count for this table (post-append)
+            try:
+                bronze_cnt = spark.table(f"{STAGING_SCHEMA}.{_tbl}").count()
+                log.info("[BRONZE][%s] post-append table count = %s", _tbl, bronze_cnt)
+            except Exception as e:
+                log.warning("[BRONZE][%s] Could not read bronze table for count: %s", _tbl, e)
+
+            # 2) run related dbt models for this lake table
             models = table_to_models.get(_tbl, [])
             if models:
                 run_dbt_models(models)
-            # truncate_bronze_table(spark, _tbl)
+
+                # 3) after dbt: log raw_vault row counts per model
+                for m in models:
+                    fq = f"{RAW_VAULT_SCHEMA}.{m}"
+                    try:
+                        cnt = spark.table(fq).count()
+                        log.info("[RAW_VAULT][%s] row_count = %s", fq, cnt)
+                    except Exception as e:
+                        log.warning("[RAW_VAULT][%s] count failed: %s", fq, e)
 
         q = start_bronze_writer(spark, table_name, df_stream, on_after_write=after_write)
         if q:
