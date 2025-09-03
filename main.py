@@ -549,17 +549,27 @@ def main():
         run_dbt_models(sorted(models_to_run))
 
     # 3) INITIAL FULL LOAD for any lake tables whose DV objects were just created
+    produced_once = set()
     if tables_needing_initial_load:
-        log.info(f"[INITIAL LOAD] Producing full load for tables: {sorted(tables_needing_initial_load)}]")
-        # Produce once: this pushes all historical rows (by table) to Kafka
-        produce_tables_once(sorted(tables_needing_initial_load))
-        log.info("[INITIAL LOAD] Full load events produced")
+        todo = sorted(list(tables_needing_initial_load))
+        log.info("[INITIAL LOAD] Producing full load for tables: %s", todo)
+        produce_tables_once(todo)
+        produced_once |= set(todo)
 
-    # One-shot initial load so the writer has data to land and dbt can build from Bronze
-    try:
-        produce_tables_once(lake_tables)
-    except Exception as e:
-        log.warning(f"[Bootstrap] Initial produce failed (continuing with streaming CDC): {e}")
+    remaining = [t for t in lake_tables if t not in produced_once]
+    if remaining:
+        produce_tables_once(remaining)
+    # if tables_needing_initial_load:
+    #     log.info(f"[INITIAL LOAD] Producing full load for tables: {sorted(tables_needing_initial_load)}]")
+    #     # Produce once: this pushes all historical rows (by table) to Kafka
+    #     produce_tables_once(sorted(tables_needing_initial_load))
+    #     log.info("[INITIAL LOAD] Full load events produced")
+#
+    # # One-shot initial load so the writer has data to land and dbt can build from Bronze
+    # try:
+    #     produce_tables_once(lake_tables)
+    # except Exception as e:
+    #     log.warning(f"[Bootstrap] Initial produce failed (continuing with streaming CDC): {e}")
 
     # 4) Start CDC producer and streaming consumer
     stop_event = threading.Event()
