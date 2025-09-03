@@ -7,7 +7,7 @@ from pyspark.sql.functions import current_timestamp, lit
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-from config import STAGING_SCHEMA
+from config import STAGING_SCHEMA, CHECKPOINT_PATH
 from utils.schema_helpers import align_to_columns, bronze_target_columns
 
 
@@ -49,7 +49,7 @@ def start_bronze_writer(
         spark: SparkSession,
         table_name: str,
         df_stream: DataFrame,
-        checkpoint_base: str = "./data/checkpoints",
+        checkpoint_base: str = CHECKPOINT_PATH,
         on_after_write=None
 ):
     """

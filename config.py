@@ -75,3 +75,4 @@ DBT_PROFILES_DIR = os.path.join(os.path.dirname(__file__), "profiles")
 DBT_MODELS_JSON_DIR = os.path.join(os.path.dirname(__file__), "models", "json")
 DBT_MODELS_SQL_DIR = os.path.join(os.path.dirname(__file__), "models", "sql")
 
+CHECKPOINT_PATH = os.getenv("CHECKPOINT_PATH", "./data/checkpoints")
