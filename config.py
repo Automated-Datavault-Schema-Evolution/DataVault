@@ -23,6 +23,8 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "lake_stream")
 KAFKA_STARTING_OFFSETS = os.getenv("KAFKA_STARTING_OFFSETS", "earliest")
 KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "datalake-stream")
+KAFKA_PARTITIONS = int(os.getenv("KAFKA_PARTITIONS", "8"))
+KAFKA_REPLICATION = int(os.getenv("KAFKA_REPLICATION", "1"))
 
 # Spark
 SPARK_MASTER = os.getenv("SPARK_MASTER", "spark://datavault-ingestion-spark-master:7078")
@@ -45,14 +47,8 @@ SPARK_SERIALIZER = os.getenv("SPARK_SERIALIZER", "org.apache.spark.serializer.Kr
 SPARK_KRYO_BUFFER_MAX = os.getenv("SPARK_KRYO_BUFFER_MAX", "256m")
 SPARK_ADAPTIVE_EXECUTION = os.getenv("SPARK_ADAPTIVE_EXECUTION", "true").lower() == "true"
 SPARK_DYNAMIC_SHUFFLE_TRACKING = os.getenv("SPARK_DYNAMIC_SHUFFLE_TRACKING", "true").lower() == "true"
-# Autoscaling configuration for Spark workers
-SPARK_AUTOSCALE = os.getenv("SPARK_AUTOSCALE", "false").lower() == "true"
-SPARK_WORKER_MAX = int(os.getenv("SPARK_WORKER_MAX", "5"))
-SPARK_WORKER_MIN = int(os.getenv("SPARK_WORKER_MIN", "1"))
-SPARK_WORKER_IMAGE = os.getenv("SPARK_WORKER_IMAGE", "bitnami/spark:latest")
-SPARK_WORKER_CONTAINER_PREFIX = os.getenv("SPARK_WORKER_CONTAINER_PREFIX", "spark-worker-")
-SPARK_WORKER_CPU_THRESHOLD = float(os.getenv("SPARK_WORKER_CPU_THRESHOLD", "80"))
-DOCKER_NETWORK = os.getenv("DOCKER_NETWORK", "data_automation-net")
+SPARK_SQL_ADAPTIVE_COALESCE_PARTITIONS = os.getenv("SPARK_SQL_ADAPTIVE_COALESCE_PARTITIONS", "true").lower() == "true"
+SPARK_SQL_ADAPTIVE_ADVISORY_PARTITION_SIZE = os.getenv("SPARK_SQL_ADAPTIVE_ADVISORY_PARTITION_SIZE", "64m")
 
 # Thift Connection
 THRIFT_HOST = os.getenv("THRIFT_HOST", "localhost")

@@ -13,7 +13,7 @@ from psycopg2 import sql
 from config import (
     LAKE_TYPE, PARQUET_PATH,
     RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER, RDBMS_PASSWORD, RDBMS_SCHEMA,
-    KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC,
+    KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, KAFKA_PARTITIONS, KAFKA_REPLICATION,
 )
 from utils.helper_spark import get_spark_session
 from utils.schema_helpers import introspect_lake_columns
@@ -28,13 +28,7 @@ def build_initial_load_sql(table: str) -> str:
     return f'SELECT {col_list} FROM "{RDBMS_SCHEMA}"."{table}"'
 
 # --- Kafka topic management ---
-def check_and_create_topic(
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        topic_name=KAFKA_TOPIC,
-        num_partitions=1,
-        replication_factor=1,
-        timeout_sec=30
-):
+def check_and_create_topic(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS, topic_name=KAFKA_TOPIC, num_partitions=KAFKA_PARTITIONS, replication_factor=KAFKA_REPLICATION, timeout_sec=30):
     """
     Ensures a Kafka topic exists and waits until at least one partition is available.
     """
@@ -42,6 +36,22 @@ def check_and_create_topic(
     topics = admin.list_topics()
     if topic_name in topics:
         log.debug(f"[Kafka] Topic '{topic_name}' already exists.")
+        # ensure it has at least num_partitions
+        try:
+            prod = KafkaProducer(bootstrap_servers=bootstrap_servers)
+            current = prod.partitions_for(topic_name)
+            prod.close()
+            cur_cnt = len(current) if current else 0
+        except Exception as e:
+            cur_cnt = 0
+
+        if cur_cnt < num_partitions:
+            try:
+                log.warning(f"[Kafka] Increasing partitions for '{topic_name}' from {cur_cnt} to {num_partitions}")
+                admin.create_partitions({topic_name: NewPartitions(total_count=num_partitions)})
+            except Exception as e:
+                log.error(f"[Kafka] Could not increase partitions: {e}")
+
     else:
         log.warning(f"[Kafka] Topic '{topic_name}' does not exist. Creating...")
         topic = NewTopic(name=topic_name, num_partitions=num_partitions, replication_factor=replication_factor)

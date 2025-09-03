@@ -22,6 +22,7 @@ from utils.bronze_ingestor import start_bronze_writer, truncate_bronze_table, en
 from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir
 from utils.schema_helpers import bronze_target_columns
 
+_DBT_LOCK = threading.Lock()  # serialize dbt runs during streaming
 
 def write_text_if_changed(path: str, content: str) -> bool:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -50,7 +51,8 @@ def run_dbt_models(models):
           ] + sorted(models)
     log.info(f"[DBT] Running: {cmd}")
     # use check=False to keep app running even if some models fail
-    subprocess.run(cmd, check=False)
+    with _DBT_LOCK:
+        subprocess.run(cmd, check=False)
 
 
 def _resolve_thrift(target_cfg):

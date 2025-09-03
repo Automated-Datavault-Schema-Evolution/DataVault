@@ -72,6 +72,7 @@ def get_spark_session(app_name="Kafka_Consumer_Lake_Handler"):
     if SPARK_DYNAMIC_ALLOCATION:
         builder = (
             builder.config("spark.dynamicAllocation.enabled", "true")
+            .config("spark.dynamicAllocation.shuffleTracking.enabled", str(SPARK_DYNAMIC_SHUFFLE_TRACKING).lower())
             .config("spark.dynamicAllocation.minExecutors", SPARK_DYNAMIC_ALLOCATION_MIN_EXECUTORS)
             .config("spark.dynamicAllocation.maxExecutors", SPARK_DYNAMIC_ALLOCATION_MAX_EXECUTORS)
             .config("spark.dynamicAllocation.initialExecutors", SPARK_DYNAMIC_ALLOCATION_INITIAL_EXECUTORS)

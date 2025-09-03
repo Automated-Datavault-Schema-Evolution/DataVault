@@ -68,9 +68,11 @@ def start_bronze_writer(
     os.makedirs(checkpoint_path, exist_ok=True)
 
     def write_batch(batch_df: DataFrame, batch_id: int):
+        batch_df = batch_df.persist(StorageLevel.MEMORY_AND_DISK)
         # Fast empty-batch check
         if batch_df.limit(1).count() == 0:
             log.info("[BRONZE][%s][batch=%s] Empty micro-batch, nothing to write", table_name, batch_id)
+            batch_df.unpersist(blocking=False)
             return
 
         # 1) Align to expected business columns (no control cols yet)
@@ -99,6 +101,7 @@ def start_bronze_writer(
             "[BRONZE][%s][batch=%s] incoming=%s, written=%s, bronze_total=%s",
             table_name, batch_id, in_cnt, out_cnt, total_cnt
         )
+        batch_df.unpersist(blocking=False)
 
         # Optional callback
         if on_after_write is not None:
