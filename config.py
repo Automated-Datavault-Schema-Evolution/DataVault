@@ -12,7 +12,7 @@ RAW_VAULT_SCHEMA = os.getenv("RAW_VAULT_SCHEMA", "raw_vault")
 
 # RDBMS settings
 RDBMS_HOST = os.getenv("POSTGRES_HOST", "localhost")
-RDBMS_PORT = int(os.getenv("POSTGRESS_PORT", 5432))
+RDBMS_PORT = int(os.getenv("POSTGRES_PORT", 5432))
 RDBMS_DB = os.getenv("POSTGRES_DB")
 RDBMS_USER = os.getenv("POSTGRES_USER")
 RDBMS_PASSWORD = os.getenv("POSTGRES_PASSWORD")
