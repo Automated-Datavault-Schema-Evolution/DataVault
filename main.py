@@ -20,6 +20,7 @@ from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
 from utils.bronze_ingestor import start_bronze_writer, truncate_bronze_table, ensure_bronze_table_exists
 from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir
+from utils.performance_logger import PerfListener, log_progress_periodically
 from utils.schema_helpers import bronze_target_columns
 
 _DBT_LOCK = threading.Lock()  # serialize dbt runs during streaming
@@ -369,6 +370,7 @@ def infer_schema_from_cdc_event(spark, table_name):
 
 def streaming_dv_consumer_and_dbt(models_to_run):
     spark = get_spark_session("DataVault_Streaming_Consumer")
+    spark.streams.addListener(PerfListener())
     from pyspark.sql.functions import col, from_json
     from pyspark.sql.types import StructType, StructField, StringType
     json_schema = StructType([
@@ -431,17 +433,21 @@ def streaming_dv_consumer_and_dbt(models_to_run):
 
                 # 3) after dbt: log raw_vault row counts per model
                 for m in models:
-                    fq = f"{RAW_VAULT_SCHEMA}.{m}"
+
                     try:
-                        cnt = spark.table(fq).count()
-                        log.info("[RAW_VAULT][%s] row_count = %s", fq, cnt)
+                        fq = f"{RAW_VAULT_SCHEMA}.{m}"
+                        if spark.catalog.tableExists(fq):
+                            cnt = spark.table(fq).count()
+                            log.info("[RAW_VAULT][%s] row_count = %s", fq, cnt)
+                        else:
+                            log.info("[RAW_VAULT][%s] not visible to this Spark session (yet)", fq)
                     except Exception as e:
-                        log.warning("[RAW_VAULT][%s] count failed: %s", fq, e)
+                        log.debug("[RAW_VAULT][%s] count skipped (likely path/catalog mismatch): %s", fq, e)
 
         q = start_bronze_writer(spark, table_name, df_stream, on_after_write=after_write)
         if q:
             queries.append((table_name, q))
-
+        log_progress_periodically(q)
         meta = extract_metadata(table_name, df_stream)
         hubs, links, sats = split_datavault(table_name, meta)
         for hub in hubs:
@@ -485,6 +491,7 @@ def streaming_dv_consumer_and_dbt(models_to_run):
 def bootstrap_bronze(lake_tables, load_table):
     from pyspark.sql.types import StructType, StructField, StringType
     spark = get_spark_session("DataVault_Bootstrap")
+    spark.streams.addListener(PerfListener())
 
     for t in lake_tables:
         # Get column names from the lake; make a simple all-STRING schema for the empty Bronze

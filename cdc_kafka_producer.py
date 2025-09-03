@@ -16,6 +16,7 @@ from config import (
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, KAFKA_PARTITIONS, KAFKA_REPLICATION,
 )
 from utils.helper_spark import get_spark_session
+from utils.performance_logger import PerfListener
 from utils.schema_helpers import introspect_lake_columns
 
 WATERMARK_FILE = "cdc_watermarks.json"
@@ -23,6 +24,7 @@ WATERMARK_FILE = "cdc_watermarks.json"
 def build_initial_load_sql(table: str) -> str:
     # Use only real columns from the lake
     spark = get_spark_session()
+    spark.streams.addListener(PerfListener())
     cols = introspect_lake_columns(spark, table)  # e.g., ['accountid', ...]
     col_list = ", ".join([f'"{c}"' for c in cols])  # quote for safety
     return f'SELECT {col_list} FROM "{RDBMS_SCHEMA}"."{table}"'
