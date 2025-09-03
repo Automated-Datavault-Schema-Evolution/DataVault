@@ -5,7 +5,7 @@ import time
 import pandas as pd
 import psycopg2
 from kafka import KafkaProducer
-from kafka.admin import KafkaAdminClient, NewTopic
+from kafka.admin import KafkaAdminClient, NewTopic, NewPartitions
 from kafka.errors import TopicAlreadyExistsError
 from logger import log
 from psycopg2 import sql
