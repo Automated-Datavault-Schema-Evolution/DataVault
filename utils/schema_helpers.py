@@ -4,7 +4,7 @@ from pyspark.sql import SparkSession, functions as F
 from logger import log
 from config import (
     LAKE_TYPE, PARQUET_PATH,
-    RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER, RDBMS_PASSWORD, RDBMS_SCHEMA
+    RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER, RDBMS_PASSWORD, RDBMS_SCHEMA, STAGING_SCHEMA
 )
 
 def introspect_lake_columns(spark: SparkSession, table: str) -> List[str]:
@@ -35,19 +35,20 @@ def introspect_lake_columns(spark: SparkSession, table: str) -> List[str]:
 
 def bronze_target_columns(spark: SparkSession, table: str) -> List[str]:
     """
-    Target set for bronze.<table>:
-    - If table already exists in bronze, use its schema (authoritative).
+    Target set for <STAGING_SCHEMA>.<table>:
+    - If table already exists in the staging schema, use its schema (authoritative).
     - Else use lake schema (introspection).
     NOTE: Does not include the control columns we add (__ingested_at, __record_source).
     """
     try:
-        if spark._jsparkSession.catalog().tableExists(f"bronze.{table}"):
-            cols = [f.name for f in spark.table(f"bronze.{table}").schema.fields]
+        fq = f"{STAGING_SCHEMA}.{table}"
+        if spark.catalog.tableExists(fq):  # use public API (no _jsparkSession)
+            cols = [f.name for f in spark.table(fq).schema.fields]
             cols = [c.lower() for c in cols if c not in ("__ingested_at", "__record_source")]
-            log.debug(f"[Schema] Existing bronze.{table} columns: {cols}")
+            log.debug(f"[Schema] Existing {fq} columns: {cols}")
             return cols
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"[Schema] tableExists/introspection fallback for {STAGING_SCHEMA}.{table}: {e}")
     return introspect_lake_columns(spark, table)
 
 

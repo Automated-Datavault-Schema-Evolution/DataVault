@@ -1,7 +1,8 @@
 import re
 from logger import log
 
-KEY_SUFFIXES = ["id", "nr", "key", "number"]
+# Added 'code' to suffixes
+KEY_SUFFIXES = ["id", "nr", "key", "number", "code"]
 TECH_COLS = {"modified_at", "__ingested_at", "__record_source"}
 
 def _normalize(name: str) -> str:
@@ -97,24 +98,26 @@ def split_datavault(table_name, meta):
     )
     return hubs, links, satellites
 
+
 def get_model_type(meta):
     cols = meta['columns']
     bk = meta['business_keys']
     n_cols = len(cols)
     n_bk = len(bk)
     log.debug(f"Determining model type with {n_cols} columns and {n_bk} business keys")
+
     if n_bk == 0:
         log.warning("No business keys found; defaulting model type to 'sat'")
+
     # Heuristic:
     # Link: >1 BK and (almost) all columns are BKs
-    # Hub:  1 BK (possibly with load_datetime)
+    # Hub:  1 BK
     # Sat:  Anything else
-
-    # If only one BK and (almost) all columns are BKs or audit fields, it's a Hub
     if n_bk == 1:
         model = "hub"
     else:
-        audit_cols = {"load_datetime", "created_at", "modified_at", "record_source"}
+        audit_cols = {"load_datetime", "created_at", "modified_at", "record_source",
+                      "__ingested_at", "__record_source"}  # include Bronze tech cols
         non_bk = [c for c in cols if c not in bk and c.lower() not in audit_cols]
         if n_bk > 1 and len(non_bk) == 0:
             model = "link"
