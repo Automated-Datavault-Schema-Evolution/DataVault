@@ -222,7 +222,7 @@ def produce_tables_once(tables):
     producer.close()
 
 
-def cdc_producer_insert_only():
+def cdc_producer_insert_only(stop_event=None):
     # Ensure topic exists and is ready
     check_and_create_topic()
 
@@ -234,7 +234,8 @@ def cdc_producer_insert_only():
     )
     log.info(f"[CDC Producer] Insert-only CDC from {LAKE_TYPE.upper()} staging area")
     watermarks = load_watermarks()
-    while True:
+    stop = stop_event.is_set if stop_event else (lambda: False)
+    while not stop():
         if LAKE_TYPE == "parquet":
             tables = get_parquet_tables()
             load_func = load_parquet_table
