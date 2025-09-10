@@ -19,7 +19,8 @@ from config import (
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
 from utils.bronze_ingestor import ensure_bronze_table_exists
-from utils.helper_service_ready import wait_for_lake, wait_for_kafka
+from utils.helper_service_ready import wait_for_lake, wait_for_kafka, wait_for_kafka_increase, \
+    wait_for_stream_offset_growth
 from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir
 from utils.performance_logger import PerfListener, log_progress_periodically
 from utils.schema_helpers import bronze_target_columns
@@ -438,11 +439,12 @@ def streaming_dv_consumer_and_dbt(models_to_run):
     # --- 1) Start a single generic stream (no pre-known schemas) ---
     # Use subscribePattern so the stream comes up even if the topic is created a bit later,
     # and refresh Kafka metadata *quickly* to avoid the 5-minute default cache.
+    log.info("[STREAM][source] bootstrap=%s topic=%s startingOffsets=earliest", KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC)
     src = (
         spark.readStream
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
-        .option("subscribe", os.getenv("KAFKA_TOPIC","lake_stream"))
+        .option("subscribe", KAFKA_TOPIC)
         .option("startingOffsets", "earliest")              # backlog on first run; checkpoint takes over later
         .option("failOnDataLoss", "false")
         # FAST metadata refresh / discovery to avoid stalling after topic creation
@@ -542,7 +544,7 @@ def streaming_dv_consumer_and_dbt(models_to_run):
 
     # --- Start the stream (add a real-time trigger so it actually fires) ---
     trigger_every = os.environ.get("STREAM_TRIGGER", "2 seconds")  # override via env if desired
-    q = (
+    query = (
         src.writeStream
         .outputMode("append")
         .queryName(f"{KAFKA_TOPIC}-generic-ingestor")
@@ -553,22 +555,24 @@ def streaming_dv_consumer_and_dbt(models_to_run):
     )
 
     log.info("[STREAM] Query started: id=%s, name=%s, trigger=%s, checkpoint=%s",
-             q.id, q.name, trigger_every, checkpoint_dir)
-    log_progress_periodically(q)
+             query.id, query.name, trigger_every, checkpoint_dir)
+    threading.Thread(target=log_progress_periodically, args=(query,), daemon=True).start()
 
     # Keep prior behavior: don't upfront-run dbt; we trigger per-batch
     if models_to_run:
         log.info("[DBT] Skipping initial run; will trigger models after first micro-batches.")
 
-    log.info("Streaming ingestion to bronze is running. Press Ctrl+C to stop.")
-    try:
-        spark.streams.awaitAnyTermination()
-    finally:
-        try:
-            q.stop()
-        except Exception:
-            pass
-        log.info("[BRONZE] Stopped streaming query")
+    # log.info("Streaming ingestion to bronze is running. Press Ctrl+C to stop.")
+    # try:
+    #     spark.streams.awaitAnyTermination()
+    # finally:
+    #     try:
+    #         q.stop()
+    #     except Exception:
+    #         pass
+    #     log.info("[BRONZE] Stopped streaming query")
+    # Non-blocking: let the caller control lifecycle (await/stop).
+    return query
 
 
 
@@ -639,20 +643,14 @@ def main():
         # Mode switch for CRON bulk runs
         processing_mode = PROCESSING_MODE.lower()
         if processing_mode not in {"streaming", "bulk"}:
-            log.warning(f"[MODE] Unknown INGESTION_MODE={PROCESSING_MODE} -> defaulting to 'streaming'")
+            log.warning(f"[MODE] Unknown PROCESSING={PROCESSING_MODE} -> defaulting to 'streaming'")
             processing_mode = "streaming"
 
         # -------- Phase 2: Stream up (consumer) --------
         stop_event = threading.Event()
+        query = None
         if processing_mode == "streaming":
-            stream_thread = threading.Thread(
-             target=streaming_dv_consumer_and_dbt,
-             args=(models_to_run,),
-             daemon=True,
-             name="dv-streaming-consumer",
-            )
-            stream_thread.start()
-
+            query = streaming_dv_consumer_and_dbt(models_to_run)
             # Optional: very short pause to let Spark attach to Kafka before we produce
             # (not strictly required, but avoids a tight race on slow startups)
             try:
@@ -665,14 +663,21 @@ def main():
         if processing_mode == 'bulk':
             # TODO: IMPLEMENT CRON JOB FRIENDLY PROCESSING ---> SEE DataLake service
             log.info("[PROCESSING-MODE] BULK: producing once for all lake tables and exiting")
-            produce_tables_once(sorted(lake_tables))  # CRON-friendly one shot
+            produced_map = produce_tables_once(sorted(lake_tables))  # CRON-friendly one shot
+            # Assert that Kafka actually received what we produced
+            wait_for_kafka_increase(sum(produced_map.values()), timeout_sec=60)
             return
         else:
             produced_once = set()
             if tables_needing_initial_load:
                 todo = sorted(list(tables_needing_initial_load))
                 log.info("[INITIAL LOAD] Producing full load for tables: %s", todo)
-                produce_tables_once(todo)  # sends historical rows to Kafka; streaming will ingest them
+                produced_map = produce_tables_once(todo)  # sends historical rows to Kafka; streaming will ingest them
+                produced_total = sum(produced_map.values())
+                # Gate on Kafka offsets and then on Spark’s view of them
+                wait_for_kafka_increase(produced_total, timeout_sec=60)
+                if query is not None:
+                    wait_for_stream_offset_growth(query, produced_total, timeout_sec=60)
                 produced_once |= set(todo)
 
             remaining = [t for t in lake_tables if t not in produced_once]
@@ -680,7 +685,11 @@ def main():
                 # In case some lake tables already existed but didn't need DV scaffolding,
                 # still produce their initial backlog now that the stream is attached.
                 log.info("[INITIAL LOAD] Producing full load for remaining tables: %s", remaining)
-                produce_tables_once(remaining)
+                produced_map = produce_tables_once(remaining)
+                produced_total = sum(produced_map.values())
+                wait_for_kafka_increase(produced_total, timeout_sec=60)
+                if query is not None:
+                    wait_for_stream_offset_growth(query, produced_total, timeout_sec=60)
 
         # -------- Phase 4: Continuous CDC producer (insert-only) --------
         cdc_thread = threading.Thread(
@@ -692,11 +701,16 @@ def main():
 
         # -------- Phase 5: Lifecyle / graceful shutdown --------
         try:
-            stream_thread.join()
+            if query is not None:
+                query.awaitTermination()
         except KeyboardInterrupt:
             log.info("Shutting down CDC producer.")
             stop_event.set()
-            # cdc_thread.join()
+            if query is not None:
+                try:
+                    query.stop()
+                except Exception:
+                    pass
             log.info("All done.")
 
 if __name__ == "__main__":
