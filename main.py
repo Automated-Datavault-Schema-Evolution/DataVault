@@ -5,36 +5,50 @@ import threading
 
 import pandas as pd
 import yaml
+import fcntl
 from jinja2 import Template
 from logger import log
 from pyhive import hive
 
-from cdc_kafka_producer import cdc_producer_insert_only, produce_tables_once
+from cdc_kafka_producer import cdc_producer_insert_only, produce_tables_once, check_and_create_topic
 from config import (
     LAKE_TYPE, PARQUET_PATH,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
     RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, DBT_MODELS_SQL_DIR,
-    KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID, STAGING_SCHEMA, RAW_VAULT_SCHEMA, )
+    KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID, STAGING_SCHEMA, RAW_VAULT_SCHEMA, PROCESSING_MODE, )
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
 from utils.bronze_ingestor import ensure_bronze_table_exists
+from utils.helper_service_ready import wait_for_lake, wait_for_kafka
 from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir
 from utils.performance_logger import PerfListener, log_progress_periodically
 from utils.schema_helpers import bronze_target_columns
 
 _DBT_LOCK = threading.Lock()  # serialize dbt runs during streaming
 
+class _SingletonRunLock():
+    """
+    Best-effort singelton run guard to avoid two orchestrators booting oncurrently.
+    """
+    def __init__(self, path="/tmp/dv_orchestrator.lock"):
+        self.path = path
+        self._fh = None
 
-def assert_kafka_reachable(spark, bootstrap, topic):
-    df = (spark.read
-          .format("kafka")
-          .option("kafka.bootstrap.servers", bootstrap)
-          .option("subscribe", topic)
-          .option("startingOffsets", "earliest")
-          .option("endingOffsets", "latest")
-          .load())
-    parts = df.selectExpr("partition").distinct().count()
-    log.info("[KAFKA SMOKE] topic=%s partitions_visible=%s via %s", topic, parts, bootstrap)
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self._fh = open(self.path, "w")
+        fcntl.flock(self._fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self._fh.write(str(os.getpid()))
+        self._fh.flush()
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self._fn, fcntl.LOCK_UN)
+            self._fh.close()
+        except Exception:
+            pass
+
 
 def write_text_if_changed(path: str, content: str) -> bool:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -406,16 +420,6 @@ def streaming_dv_consumer_and_dbt(models_to_run):
     except Exception:
         pass
 
-    topic = os.environ.get("KAFKA_TOPIC", "lake_stream")
-    bootstrap = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
-
-    print("[INFO] KAFKA_TOPIC:", topic)
-    print("[INFO] KAFKA_BOOTSTRAP_SERVERS:", bootstrap)
-
-    assert_kafka_reachable(spark,
-                           os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
-                           os.getenv("KAFKA_TOPIC", "lake_stream"))
-
     # Envelope schema; payload remains a raw JSON string per-table
     envelope_schema = StructType([
         StructField("table", StringType()),
@@ -426,7 +430,7 @@ def streaming_dv_consumer_and_dbt(models_to_run):
 
     # --- Checkpoint management ---
     checkpoint_root = os.environ.get("CHECKPOINT_PATH", "/data/checkpoints")
-    checkpoint_dir = os.path.join(checkpoint_root, f"{topic}_generic_v3")
+    checkpoint_dir = os.path.join(checkpoint_root, f"{KAFKA_TOPIC}_generic_v3")
     if os.environ.get("STREAM_CHECKPOINT_RESET", "").lower() in {"1", "true", "yes"}:
         log.warning("[STREAM] Wiping checkpoint dir: %s", checkpoint_dir)
         shutil.rmtree(checkpoint_dir, ignore_errors=True)
@@ -434,12 +438,10 @@ def streaming_dv_consumer_and_dbt(models_to_run):
     # --- 1) Start a single generic stream (no pre-known schemas) ---
     # Use subscribePattern so the stream comes up even if the topic is created a bit later,
     # and refresh Kafka metadata *quickly* to avoid the 5-minute default cache.
-    pattern = f"^{re.escape(topic)}$"
-
     src = (
         spark.readStream
         .format("kafka")
-        .option("kafka.bootstrap.servers", bootstrap)
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
         .option("subscribe", os.getenv("KAFKA_TOPIC","lake_stream"))
         .option("startingOffsets", "earliest")              # backlog on first run; checkpoint takes over later
         .option("failOnDataLoss", "false")
@@ -543,7 +545,7 @@ def streaming_dv_consumer_and_dbt(models_to_run):
     q = (
         src.writeStream
         .outputMode("append")
-        .queryName(f"{topic}-generic-ingestor")
+        .queryName(f"{KAFKA_TOPIC}-generic-ingestor")
         .option("checkpointLocation", checkpoint_dir)
         .trigger(processingTime=trigger_every)
         .foreachBatch(_foreach_batch)
@@ -593,87 +595,109 @@ def main():
     ensure_profiles_dir()
     ensure_database_schema()
 
-    lake_tables, load_table = discover_lake()
-    bootstrap_bronze(lake_tables, load_table)  # precreate empty bronze tables (DDL)
+    # wait for lake readiness before discovery
+    wait_for_lake(timeout_sec=60)
 
-    generate_schema_yml(lake_tables)
-    existing_models = get_existing_model_tables()
-    vault_tables = get_raw_vault_tables()
+    with _SingletonRunLock():
+        # -------- Phase 0: Discover lake + bootstrap Bronze/DBT scaffolding --------
+        lake_tables, load_table = discover_lake()
+        bootstrap_bronze(lake_tables, load_table)  # precreate empty bronze tables (DDL)
 
-    # 1) Determine which tables are new (no model yet) and which vault objects are missing
-    tables_without_models = [t for t in lake_tables if t not in existing_models]
-    models_to_run = set()
-    tables_needing_initial_load = set()
+        generate_schema_yml(lake_tables)
+        existing_models = get_existing_model_tables()
+        vault_tables = get_raw_vault_tables()
 
-    if tables_without_models:
-        # Generate models for new tables
-        new_models = ensure_dbt_models_for_lake(tables_without_models, load_table)
-        models_to_run.update(new_models)
-        # all new tables will need an initial full load after objects are created
-        tables_needing_initial_load.update(tables_without_models)
+        # Determine which tables are new (no model yet) and which vault objects are missing
+        tables_without_models = [t for t in lake_tables if t not in existing_models]
+        models_to_run = set()
+        tables_needing_initial_load = set()
 
-    # If any model exists but the physical table is missing in the vault, we must create it
-    for table, model_names in existing_models.items():
-        for m in model_names:
-            if m not in vault_tables:
-                models_to_run.add(m)
-                # this lake table is missing at least one DV object -> full load needed
-                tables_needing_initial_load.add(table)
+        if tables_without_models:
+            # Generate models for new tables
+            new_models = ensure_dbt_models_for_lake(tables_without_models, load_table)
+            models_to_run.update(new_models)
+            # all new tables will need an initial full load after objects are created
+            tables_needing_initial_load.update(tables_without_models)
 
-    if models_to_run:
-        log.info(f"[DBT] Will run for: {sorted(models_to_run)}")
-        # Create raw_vault objects up-front (first run); later runs will also be triggered by streaming callback
-        run_dbt_models(sorted(models_to_run))
+        # If any model exists but the physical table is missing in the vault, we must create it
+        for table, model_names in existing_models.items():
+            for m in model_names:
+                if m not in vault_tables:
+                    models_to_run.add(m)
+                    # this lake table is missing at least one DV object -> full load needed
+                    tables_needing_initial_load.add(table)
 
-    # --- start streaming FIRST (so it's subscribed before we produce) ---
-    stop_event = threading.Event()
-    stream_thread = threading.Thread(
-        target=streaming_dv_consumer_and_dbt,
-        args=(models_to_run,),
-        daemon=True,
-        name="dv-streaming-consumer",
-    )
-    stream_thread.start()
+        if models_to_run:
+            log.info(f"[DBT] Will run for: {sorted(models_to_run)}")
+            # Create raw_vault objects up-front (first run); later runs will also be triggered by streaming callback
+            run_dbt_models(sorted(models_to_run))
 
-    # Optional: very short pause to let Spark attach to Kafka before we produce
-    # (not strictly required, but avoids a tight race on slow startups)
-    try:
-        import time
-        time.sleep(2)
-    except Exception:
-        pass
+        # -------- Phase 1: Kafka readiness + topic ensure --------
+        check_and_create_topic() # make sure topic exists before streams/producers
+        wait_for_kafka(KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, timeout_sec=60)
 
-    # --- initial full load (backlog) AFTER stream is running ---
-    produced_once = set()
-    if tables_needing_initial_load:
-        todo = sorted(list(tables_needing_initial_load))
-        log.info("[INITIAL LOAD] Producing full load for tables: %s", todo)
-        produce_tables_once(todo)  # sends historical rows to Kafka; streaming will ingest them
-        produced_once |= set(todo)
+        # Mode switch for CRON bulk runs
+        processing_mode = PROCESSING_MODE.lower()
+        if processing_mode not in {"streaming", "bulk"}:
+            log.warning(f"[MODE] Unknown INGESTION_MODE={PROCESSING_MODE} -> defaulting to 'streaming'")
+            processing_mode = "streaming"
 
-    remaining = [t for t in lake_tables if t not in produced_once]
-    if remaining:
-        # In case some lake tables already existed but didn't need DV scaffolding,
-        # still produce their initial backlog now that the stream is attached.
-        log.info("[INITIAL LOAD] Producing full load for remaining tables: %s", remaining)
-        produce_tables_once(remaining)
+        # -------- Phase 2: Stream up (consumer) --------
+        stop_event = threading.Event()
+        if processing_mode == "streaming":
+            stream_thread = threading.Thread(
+             target=streaming_dv_consumer_and_dbt,
+             args=(models_to_run,),
+             daemon=True,
+             name="dv-streaming-consumer",
+            )
+            stream_thread.start()
 
-    # --- start continuous CDC producer ---
-    cdc_thread = threading.Thread(
-        target=cdc_producer_insert_only,
-        daemon=True,
-        name="cdc-insert-only",
-    )
-    cdc_thread.start()
+            # Optional: very short pause to let Spark attach to Kafka before we produce
+            # (not strictly required, but avoids a tight race on slow startups)
+            try:
+                import time
+                time.sleep(2)
+            except Exception:
+                pass
 
-    # --- keep the app alive while streaming runs ---
-    try:
-        stream_thread.join()
-    except KeyboardInterrupt:
-        log.info("Shutting down CDC producer.")
-        stop_event.set()
-        # cdc_thread.join()
-        log.info("All done.")
+        # -------- Phase 3: Initial full load (backlog) --------
+        if processing_mode == 'bulk':
+            # TODO: IMPLEMENT CRON JOB FRIENDLY PROCESSING ---> SEE DataLake service
+            log.info("[PROCESSING-MODE] BULK: producing once for all lake tables and exiting")
+            produce_tables_once(sorted(lake_tables))  # CRON-friendly one shot
+            return
+        else:
+            produced_once = set()
+            if tables_needing_initial_load:
+                todo = sorted(list(tables_needing_initial_load))
+                log.info("[INITIAL LOAD] Producing full load for tables: %s", todo)
+                produce_tables_once(todo)  # sends historical rows to Kafka; streaming will ingest them
+                produced_once |= set(todo)
+
+            remaining = [t for t in lake_tables if t not in produced_once]
+            if remaining:
+                # In case some lake tables already existed but didn't need DV scaffolding,
+                # still produce their initial backlog now that the stream is attached.
+                log.info("[INITIAL LOAD] Producing full load for remaining tables: %s", remaining)
+                produce_tables_once(remaining)
+
+        # -------- Phase 4: Continuous CDC producer (insert-only) --------
+        cdc_thread = threading.Thread(
+            target=cdc_producer_insert_only,
+            daemon=True,
+            name="cdc-insert-only",
+        )
+        cdc_thread.start()
+
+        # -------- Phase 5: Lifecyle / graceful shutdown --------
+        try:
+            stream_thread.join()
+        except KeyboardInterrupt:
+            log.info("Shutting down CDC producer.")
+            stop_event.set()
+            # cdc_thread.join()
+            log.info("All done.")
 
 if __name__ == "__main__":
     main()
