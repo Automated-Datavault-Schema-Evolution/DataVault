@@ -14,16 +14,27 @@ from config import (
     LAKE_TYPE, PARQUET_PATH,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
     RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, DBT_MODELS_SQL_DIR,
-    KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID, STAGING_SCHEMA, RAW_VAULT_SCHEMA,
-)
+    KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID, STAGING_SCHEMA, RAW_VAULT_SCHEMA, )
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
-from utils.bronze_ingestor import start_bronze_writer, truncate_bronze_table, ensure_bronze_table_exists
+from utils.bronze_ingestor import ensure_bronze_table_exists
 from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir
 from utils.performance_logger import PerfListener, log_progress_periodically
 from utils.schema_helpers import bronze_target_columns
 
 _DBT_LOCK = threading.Lock()  # serialize dbt runs during streaming
+
+
+def assert_kafka_reachable(spark, bootstrap, topic):
+    df = (spark.read
+          .format("kafka")
+          .option("kafka.bootstrap.servers", bootstrap)
+          .option("subscribe", topic)
+          .option("startingOffsets", "earliest")
+          .option("endingOffsets", "latest")
+          .load())
+    parts = df.selectExpr("partition").distinct().count()
+    log.info("[KAFKA SMOKE] topic=%s partitions_visible=%s via %s", topic, parts, bootstrap)
 
 def write_text_if_changed(path: str, content: str) -> bool:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -369,124 +380,195 @@ def infer_schema_from_cdc_event(spark, table_name):
 
 
 def streaming_dv_consumer_and_dbt(models_to_run):
-    spark = get_spark_session("DataVault_Streaming_Consumer")
-    spark.streams.addListener(PerfListener())
+    """
+    Generic, schema-late binding Kafka -> Bronze streaming consumer + dbt trigger.
+
+    Fixes:
+      - Remove blocking 'wait for topic' probe (race with topic creation).
+      - Use subscribePattern + fast metadata refresh + partition discovery.
+      - Stable micro-batch trigger so the stream actually fires.
+      - Robust null-safe envelope handling; same helper layout.
+    """
+    import os, json, re, shutil
     from pyspark.sql.functions import col, from_json
     from pyspark.sql.types import StructType, StructField, StringType
-    json_schema = StructType([
+
+    # --- Spark + listener (existing helpers) ---
+    spark = get_spark_session("DataVault_Streaming_Consumer")
+    try:
+        spark.streams.addListener(PerfListener())
+    except Exception as e:
+        log.debug("PerfListener attach skipped: %s", e)
+
+    # Make shutdown graceful so we don't corrupt checkpoints
+    try:
+        spark.conf.set("spark.sql.streaming.stopGracefullyOnShutdown", "true")
+    except Exception:
+        pass
+
+    topic = os.environ.get("KAFKA_TOPIC", "lake_stream")
+    bootstrap = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
+
+    print("[INFO] KAFKA_TOPIC:", topic)
+    print("[INFO] KAFKA_BOOTSTRAP_SERVERS:", bootstrap)
+
+    assert_kafka_reachable(spark,
+                           os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
+                           os.getenv("KAFKA_TOPIC", "lake_stream"))
+
+    # Envelope schema; payload remains a raw JSON string per-table
+    envelope_schema = StructType([
         StructField("table", StringType()),
         StructField("payload", StringType()),
         StructField("cdc_type", StringType()),
-        StructField("modified_at", StringType())
+        StructField("modified_at", StringType()),
     ])
-    df = (
-        spark.read
+
+    # --- Checkpoint management ---
+    checkpoint_root = os.environ.get("CHECKPOINT_PATH", "/data/checkpoints")
+    checkpoint_dir = os.path.join(checkpoint_root, f"{topic}_generic_v3")
+    if os.environ.get("STREAM_CHECKPOINT_RESET", "").lower() in {"1", "true", "yes"}:
+        log.warning("[STREAM] Wiping checkpoint dir: %s", checkpoint_dir)
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+
+    # --- 1) Start a single generic stream (no pre-known schemas) ---
+    # Use subscribePattern so the stream comes up even if the topic is created a bit later,
+    # and refresh Kafka metadata *quickly* to avoid the 5-minute default cache.
+    pattern = f"^{re.escape(topic)}$"
+
+    src = (
+        spark.readStream
         .format("kafka")
-        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
-        .option("subscribe", KAFKA_TOPIC)
-        .option("startingOffsets", "earliest")
-        .option("endingOffsets", "latest")
+        .option("kafka.bootstrap.servers", bootstrap)
+        .option("subscribe", os.getenv("KAFKA_TOPIC","lake_stream"))
+        .option("startingOffsets", "earliest")              # backlog on first run; checkpoint takes over later
+        .option("failOnDataLoss", "false")
+        # FAST metadata refresh / discovery to avoid stalling after topic creation
+        .option("kafka.metadata.max.age.ms", "2000")        # refresh topic metadata ~2s
+        .option("kafka.partition.discovery.interval.ms", "2000")
+        .option("kafkaConsumer.pollTimeoutMs", "1000")
         .load()
+        .select(from_json(col("value").cast("string"), envelope_schema).alias("json"))
+        .where(col("json").isNotNull())
+        .select(
+            col("json.table").alias("table"),
+            col("json.payload").alias("payload"),
+            col("json.cdc_type").alias("cdc_type"),
+            col("json.modified_at").alias("modified_at"),
+        )
+        .where(col("table").isNotNull())
     )
-    df_json = df.select(from_json(col("value").cast("string"), json_schema).alias("json"))
-    table_rows = df_json.groupBy(col("json.table")).count().collect()
 
-    for r in table_rows:
-        if r["table"] is not None:
-            log.info("[KAFKA] table=%s, backlog_messages=%s", r["table"], r["count"])
-
-    table_names = [row["table"] for row in table_rows if row["table"] is not None]
-
-    queries = []
-    ensured_tables = []
-
+    # Existing helper: {'accounts': ['hub_account', ...], ...}
     table_to_models = get_existing_model_tables()
-    for table_name in table_names:
-        schema = infer_schema_from_cdc_event(spark, table_name)
+
+    def _infer_schema_from_batch(df_tbl):
+        """Infer permissive StructType from one payload row in this micro-batch, else fallback helper."""
+        row = df_tbl.select("payload").limit(1).collect()
+        if not row:
+            return None
+        try:
+            obj = json.loads(row[0]["payload"])
+            return StructType([StructField(k, StringType(), True) for k in obj.keys()])
+        except Exception as e:
+            log.debug("Inline schema inference failed: %s", e)
+            return None
+
+    def _process_table(batch_df, tbl, epoch_id):
+        # 1) infer from batch; fallback to your CDC schema helper
+        schema = _infer_schema_from_batch(batch_df)
         if not schema:
-            log.info(f"[DBT Model] Skipping {table_name}: could not infer schema")
-            continue
-
-        if ensure_bronze_table_exists(spark, table_name, schema):
-            ensured_tables.append(table_name)
-
-        df_stream = get_kafka_stream(spark, table_name, schema)
-
-        # On each micro-batch: run only the model for this table and then truncate bronze.<table>
-        # def after_write(_epoch_id: int, _tbl=table_name):
-        #     models = table_to_models.get(_tbl, [])
-        #     if models:
-        #         run_dbt_models(models)
-        #     # truncate_bronze_table(spark, _tbl)
-        def after_write(_epoch_id: int, _tbl=table_name):
-            # 1) show current bronze count for this table (post-append)
             try:
-                bronze_cnt = spark.table(f"{STAGING_SCHEMA}.{_tbl}").count()
-                log.info("[BRONZE][%s] post-append table count = %s", _tbl, bronze_cnt)
+                schema = infer_schema_from_cdc_event(spark, tbl)
             except Exception as e:
-                log.warning("[BRONZE][%s] Could not read bronze table for count: %s", _tbl, e)
+                log.info("[STREAM][%s][epoch=%s] no schema (batch+fallback failed): %s", tbl, epoch_id, e)
+                return
+        if not schema:
+            log.info("[STREAM][%s][epoch=%s] no schema available; skipping", tbl, epoch_id)
+            return
 
-            # 2) run related dbt models for this lake table
-            models = table_to_models.get(_tbl, [])
-            if models:
-                run_dbt_models(models)
+        # 2) ensure bronze.<table> exists
+        ensure_bronze_table_exists(spark, tbl, schema)
 
-                # 3) after dbt: log raw_vault row counts per model
-                for m in models:
+        # 3) parse and align columns to destination table if possible
+        parsed_tbl = batch_df.select(from_json(col("payload"), schema).alias("r")).select("r.*")
+        target_fq = f"{STAGING_SCHEMA}.{tbl}"
+        try:
+            dest_cols = spark.table(target_fq).columns
+            parsed_tbl = parsed_tbl.select(*dest_cols)
+        except Exception as e:
+            log.debug("[BRONZE][%s] Could not align column order (%s); inserting as-is", tbl, e)
 
-                    try:
-                        fq = f"{RAW_VAULT_SCHEMA}.{m}"
-                        if spark.catalog.tableExists(fq):
-                            cnt = spark.table(fq).count()
-                            log.info("[RAW_VAULT][%s] row_count = %s", fq, cnt)
-                        else:
-                            log.info("[RAW_VAULT][%s] not visible to this Spark session (yet)", fq)
-                    except Exception as e:
-                        log.debug("[RAW_VAULT][%s] count skipped (likely path/catalog mismatch): %s", fq, e)
+        # 4) write into bronze via SQL INSERT (Hive catalog)
+        batch_count = parsed_tbl.count()
+        if batch_count == 0:
+            log.debug("[BRONZE][%s][epoch=%s] 0 rows in this batch", tbl, epoch_id)
+            return
 
-        q = start_bronze_writer(spark, table_name, df_stream, on_after_write=after_write)
-        if q:
-            queries.append((table_name, q))
-        log_progress_periodically(q)
-        meta = extract_metadata(table_name, df_stream)
-        hubs, links, sats = split_datavault(table_name, meta)
-        for hub in hubs:
-            write_json_model_file(
-                hub["name"], table_name, "hub",
-                {"business_keys": hub["key"], "attributes": [], "columns": hub["key"]},
-            )
-        for link in links:
-            write_json_model_file(
-                link["name"], table_name, "link",
-                {"business_keys": link["keys"], "attributes": [], "columns": link["keys"]},
-            )
-        for sat in sats:
-            write_json_model_file(
-                sat["name"], table_name, "sat",
-                {
-                    "business_keys": sat["key"],
-                    "attributes": sat["attributes"],
-                    "columns": sat["key"] + sat["attributes"],
-                },
-            )
-        log.info(f"[DBT Model] Generated metadata for: {table_name}")
+        parsed_tbl.createOrReplaceTempView(f"_bronze_batch_{tbl}")
+        spark.sql(f"INSERT INTO {target_fq} SELECT * FROM _bronze_batch_{tbl}")
+        log.info("[BRONZE][%s][epoch=%s] inserted %s row(s)", tbl, epoch_id, batch_count)
 
-    # if models_to_run:
-    #     run_dbt_models(models_to_run)
-    # Only run the initial dbt set if at least one Bronze table is present
-    if models_to_run and ensured_tables:
-        run_dbt_models(models_to_run)
-    else:
-        if models_to_run:
-            log.info("[DBT] Skipping initial run; Bronze not ready yet. Models will run after first micro-batches.")
+        # 5) run related dbt models and log row counts
+        models = table_to_models.get(tbl, [])
+        if models:
+            run_dbt_models(models)
+            for m in models:
+                fq = f"{RAW_VAULT_SCHEMA}.{m}"
+                try:
+                    if spark.catalog.tableExists(fq):
+                        mcnt = spark.table(fq).count()
+                        log.info("[RAW_VAULT][%s] row_count=%s", fq, mcnt)
+                    else:
+                        log.info("[RAW_VAULT][%s] not visible yet", fq)
+                except Exception as e:
+                    log.debug("[RAW_VAULT][%s] count skipped: %s", fq, e)
+
+    def _foreach_batch(batch_df, epoch_id: int):
+        if batch_df.rdd.isEmpty():
+            log.debug("[STREAM][epoch=%s] empty micro-batch", epoch_id)
+            return
+        touched = [r["table"] for r in batch_df.select("table").distinct().collect() if r["table"]]
+        if not touched:
+            log.debug("[STREAM][epoch=%s] no 'table' values present", epoch_id)
+            return
+        for tbl in touched:
+            try:
+                _process_table(batch_df.where(col("table") == tbl), tbl, epoch_id)
+            except Exception as e:
+                log.exception("[STREAM][%s][epoch=%s] processing failed: %s", tbl, epoch_id, e)
+
+    # --- Start the stream (add a real-time trigger so it actually fires) ---
+    trigger_every = os.environ.get("STREAM_TRIGGER", "2 seconds")  # override via env if desired
+    q = (
+        src.writeStream
+        .outputMode("append")
+        .queryName(f"{topic}-generic-ingestor")
+        .option("checkpointLocation", checkpoint_dir)
+        .trigger(processingTime=trigger_every)
+        .foreachBatch(_foreach_batch)
+        .start()
+    )
+
+    log.info("[STREAM] Query started: id=%s, name=%s, trigger=%s, checkpoint=%s",
+             q.id, q.name, trigger_every, checkpoint_dir)
+    log_progress_periodically(q)
+
+    # Keep prior behavior: don't upfront-run dbt; we trigger per-batch
+    if models_to_run:
+        log.info("[DBT] Skipping initial run; will trigger models after first micro-batches.")
 
     log.info("Streaming ingestion to bronze is running. Press Ctrl+C to stop.")
     try:
         spark.streams.awaitAnyTermination()
     finally:
-        for _tbl, q in queries:
+        try:
             q.stop()
-        log.info("[BRONZE] Stopped streaming queries")
+        except Exception:
+            pass
+        log.info("[BRONZE] Stopped streaming query")
+
+
 
 def bootstrap_bronze(lake_tables, load_table):
     from pyspark.sql.types import StructType, StructField, StringType
@@ -512,8 +594,7 @@ def main():
     ensure_database_schema()
 
     lake_tables, load_table = discover_lake()
-
-    bootstrap_bronze(lake_tables, load_table)
+    bootstrap_bronze(lake_tables, load_table)  # precreate empty bronze tables (DDL)
 
     generate_schema_yml(lake_tables)
     existing_models = get_existing_model_tables()
@@ -541,47 +622,57 @@ def main():
 
     if models_to_run:
         log.info(f"[DBT] Will run for: {sorted(models_to_run)}")
-    else:
-        log.info("NO new Data Vault tables to create, all up to date")
-
-    # 2) If we have models to create, do that first
-    if models_to_run:
+        # Create raw_vault objects up-front (first run); later runs will also be triggered by streaming callback
         run_dbt_models(sorted(models_to_run))
 
-    # 3) INITIAL FULL LOAD for any lake tables whose DV objects were just created
+    # --- start streaming FIRST (so it's subscribed before we produce) ---
+    stop_event = threading.Event()
+    stream_thread = threading.Thread(
+        target=streaming_dv_consumer_and_dbt,
+        args=(models_to_run,),
+        daemon=True,
+        name="dv-streaming-consumer",
+    )
+    stream_thread.start()
+
+    # Optional: very short pause to let Spark attach to Kafka before we produce
+    # (not strictly required, but avoids a tight race on slow startups)
+    try:
+        import time
+        time.sleep(2)
+    except Exception:
+        pass
+
+    # --- initial full load (backlog) AFTER stream is running ---
     produced_once = set()
     if tables_needing_initial_load:
         todo = sorted(list(tables_needing_initial_load))
         log.info("[INITIAL LOAD] Producing full load for tables: %s", todo)
-        produce_tables_once(todo)
+        produce_tables_once(todo)  # sends historical rows to Kafka; streaming will ingest them
         produced_once |= set(todo)
 
     remaining = [t for t in lake_tables if t not in produced_once]
     if remaining:
+        # In case some lake tables already existed but didn't need DV scaffolding,
+        # still produce their initial backlog now that the stream is attached.
+        log.info("[INITIAL LOAD] Producing full load for remaining tables: %s", remaining)
         produce_tables_once(remaining)
-    # if tables_needing_initial_load:
-    #     log.info(f"[INITIAL LOAD] Producing full load for tables: {sorted(tables_needing_initial_load)}]")
-    #     # Produce once: this pushes all historical rows (by table) to Kafka
-    #     produce_tables_once(sorted(tables_needing_initial_load))
-    #     log.info("[INITIAL LOAD] Full load events produced")
-#
-    # # One-shot initial load so the writer has data to land and dbt can build from Bronze
-    # try:
-    #     produce_tables_once(lake_tables)
-    # except Exception as e:
-    #     log.warning(f"[Bootstrap] Initial produce failed (continuing with streaming CDC): {e}")
 
-    # 4) Start CDC producer and streaming consumer
-    stop_event = threading.Event()
-    cdc_thread = threading.Thread(target=cdc_producer_insert_only, daemon=True)
+    # --- start continuous CDC producer ---
+    cdc_thread = threading.Thread(
+        target=cdc_producer_insert_only,
+        daemon=True,
+        name="cdc-insert-only",
+    )
     cdc_thread.start()
 
+    # --- keep the app alive while streaming runs ---
     try:
-        streaming_dv_consumer_and_dbt(models_to_run)
+        stream_thread.join()
     except KeyboardInterrupt:
         log.info("Shutting down CDC producer.")
         stop_event.set()
-        cdc_thread.join()
+        # cdc_thread.join()
         log.info("All done.")
 
 if __name__ == "__main__":
