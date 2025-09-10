@@ -25,6 +25,8 @@ KAFKA_STARTING_OFFSETS = os.getenv("KAFKA_STARTING_OFFSETS", "earliest")
 KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "datalake-stream")
 KAFKA_PARTITIONS = int(os.getenv("KAFKA_PARTITIONS", "8"))
 KAFKA_REPLICATION = int(os.getenv("KAFKA_REPLICATION", "1"))
+STREAM_CHECKPOINT_RESET = os.environ.get("STREAM_CHECKPOINT_RESET", "NO")
+CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH", "/data/checkpoints")
 
 # Spark
 SPARK_MASTER = os.getenv("SPARK_MASTER", "spark://datavault-ingestion-spark-master:7078")
@@ -75,4 +77,3 @@ DBT_PROFILES_DIR = os.path.join(os.path.dirname(__file__), "profiles")
 DBT_MODELS_JSON_DIR = os.path.join(os.path.dirname(__file__), "models", "json")
 DBT_MODELS_SQL_DIR = os.path.join(os.path.dirname(__file__), "models", "sql")
 
-CHECKPOINT_PATH = os.getenv("CHECKPOINT_PATH", "./data/checkpoints")
