@@ -23,7 +23,7 @@ from utils.helper_service_ready import wait_for_lake, wait_for_kafka, wait_for_k
     wait_for_stream_offset_growth
 from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir
 from utils.performance_logger import PerfListener, log_progress_periodically
-from utils.schema_helpers import bronze_target_columns
+from utils.schema_helpers import bronze_target_columns, infer_schema_from_cdc_event
 
 _DBT_LOCK = threading.Lock()  # serialize dbt runs during streaming
 
@@ -479,14 +479,7 @@ def streaming_dv_consumer_and_dbt(models_to_run):
             return None
 
     def _process_table(batch_df, tbl, epoch_id):
-        # 1) infer from batch; fallback to your CDC schema helper
-        schema = _infer_schema_from_batch(batch_df)
-        if not schema:
-            try:
-                schema = infer_schema_from_cdc_event(spark, tbl)
-            except Exception as e:
-                log.info("[STREAM][%s][epoch=%s] no schema (batch+fallback failed): %s", tbl, epoch_id, e)
-                return
+        schema = _infer_schema_from_batch(batch_df) or infer_schema_from_cdc_event(spark, tbl)
         if not schema:
             log.info("[STREAM][%s][epoch=%s] no schema available; skipping", tbl, epoch_id)
             return
