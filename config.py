@@ -27,6 +27,7 @@ KAFKA_PARTITIONS = int(os.getenv("KAFKA_PARTITIONS", "8"))
 KAFKA_REPLICATION = int(os.getenv("KAFKA_REPLICATION", "1"))
 STREAM_CHECKPOINT_RESET = os.environ.get("STREAM_CHECKPOINT_RESET", "NO")
 CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH", "/data/checkpoints")
+KAFKA_MAX_OFFSETS_PER_TRIGGER = int(os.getenv("KAFKA_MAX_OFFSETS_PER_TRIGGER", "50000"))
 
 # Spark
 SPARK_MASTER = os.getenv("SPARK_MASTER", "spark://datavault-ingestion-spark-master:7078")

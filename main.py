@@ -15,7 +15,8 @@ from config import (
     LAKE_TYPE, PARQUET_PATH,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
     RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, DBT_MODELS_SQL_DIR,
-    KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID, STAGING_SCHEMA, RAW_VAULT_SCHEMA, PROCESSING_MODE, )
+    KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID, STAGING_SCHEMA, RAW_VAULT_SCHEMA, PROCESSING_MODE,
+    KAFKA_MAX_OFFSETS_PER_TRIGGER, )
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
 from utils.bronze_ingestor import ensure_bronze_table_exists
@@ -357,6 +358,7 @@ def get_kafka_stream(spark, table_name, schema):
         .option("subscribe", KAFKA_TOPIC)
         .option("startingOffsets", KAFKA_STARTING_OFFSETS)  # earlist for first run, then checkpoint
         .option("groupIdPrefix", KAFKA_GROUP_ID)
+        .option("maxOffsetsPerTrigger", KAFKA_MAX_OFFSETS_PER_TRIGGER)
         .load()
     )
     df_json = df.select(from_json(col("value").cast("string"), json_schema).alias("json"))
