@@ -1,4 +1,5 @@
-pyspark==3.4.1
+pyspark==3.5.3
+delta-spark==3.3.0
 dbt-core
 dbt-spark[PyHive]
 python-dotenv
