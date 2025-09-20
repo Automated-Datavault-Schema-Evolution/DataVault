@@ -367,35 +367,6 @@ def get_kafka_stream(spark, table_name, schema):
     return df_data
 
 
-def infer_schema_from_cdc_event(spark, table_name):
-    from pyspark.sql.functions import col, from_json
-    from pyspark.sql.types import StructType, StructField, StringType
-    json_schema = StructType([
-        StructField("table", StringType()),
-        StructField("payload", StringType()),
-        StructField("cdc_type", StringType()),
-        StructField("modified_at", StringType())
-    ])
-    df = (
-        spark.read
-        .format("kafka")
-        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
-        .option("subscribe", KAFKA_TOPIC)
-        .option("startingOffsets", "earliest")
-        .option("endingOffsets", "latest")
-        .load()
-    )
-    df_json = df.select(from_json(col("value").cast("string"), json_schema).alias("json"))
-    df_table = df_json.filter(col("json.table") == table_name)
-    sample = df_table.limit(1).collect()
-    if not sample:
-        return None
-    payload_json = json.loads(sample[0]["json"]["payload"])
-    from pyspark.sql.types import StructField, StringType, StructType
-    fields = [StructField(k, StringType(), True) for k in payload_json.keys()]
-    return StructType(fields)
-
-
 def streaming_dv_consumer_and_dbt(models_to_run):
     """
     Generic, schema-late binding Kafka -> Bronze streaming consumer + dbt trigger.
