@@ -45,7 +45,7 @@ class _SingletonRunLock():
 
     def __exit__(self, *exc):
         try:
-            fcntl.flock(self._fn, fcntl.LOCK_UN)
+            fcntl.flock(self._fh, fcntl.LOCK_UN)
             self._fh.close()
         except Exception:
             pass
