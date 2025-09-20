@@ -173,7 +173,7 @@ def produce_tables_once(tables):
     producer = KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        linger_ms=100,
+        linger_ms=0,
         acks='all'
     )
 
@@ -186,6 +186,7 @@ def produce_tables_once(tables):
         raise ValueError("Unknown LAKE_TYPE (must be 'parquet' or 'rdbms')")
 
     watermarks = load_watermarks()
+    produced_counts : dict[str, int] = {}
     for table in tables:
         log.info(f"[CDC Producer] Initial load for {table}")
         try:
@@ -197,13 +198,15 @@ def produce_tables_once(tables):
             log.warning(f"Table {table} skipped: no 'modified_at' column for CDC.")
             continue
         df = df.dropna(subset=["modified_at"])
+        cnt = 0
+        futures = []
         for _, row in df.iterrows():
             payload = row.dropna().to_dict()
             modified_at = payload.get("modified_at")
             if isinstance(modified_at, pd.Timestamp):
                 modified_at = modified_at.isoformat()
             payload["modified_at"] = modified_at
-            producer.send(
+            future = producer.send(
                 KAFKA_TOPIC,
                 {
                     "table": table,
@@ -212,14 +215,26 @@ def produce_tables_once(tables):
                     "modified_at": modified_at,
                 },
             )
-        if not df.empty:
+            futures.append(future)
+            cnt += 1
+            # Block until the broker acknowledges all sends (surface any delivery errors)
+            for future in futures:
+                future.get(timeout=30)
+        # if not df.empty:
+        if cnt > 0:
             max_ts = df["modified_at"].max()
             watermarks[table] = max_ts
-            log.info(f"[CDC Producer] Produced {len(df)} events for {table}. Watermark: {max_ts}")
+            log.info(f"[CDC Producer] Produced {cnt} events for {table}. Watermark: {watermarks.get(table)}")
+        else:
+            log.info(f"[CDC Producer] Produced 0 events for {table}.")
+
+        produced_counts[table] = cnt
 
     producer.flush()
     save_watermarks(watermarks)
     producer.close()
+
+    return produced_counts
 
 
 def cdc_producer_insert_only(stop_event=None):
