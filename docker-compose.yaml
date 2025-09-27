@@ -4,9 +4,6 @@ configs:
 
 services:
   datavault-ingestion-app:
-    # user: "185:185"
-    # group_add:
-    #   - "1001"
     user: "1001:1001"
     build:
       context: .
@@ -37,6 +34,7 @@ services:
     restart: unless-stopped
     ports:
       - "4042:4042"
+    stop_grace_period: 90s
     depends_on:
       datavault-ingestion-spark-master:
         condition: service_healthy

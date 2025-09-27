@@ -1,9 +1,13 @@
+import atexit
 import fcntl
 import json
 import os
+import signal
 import subprocess
 import threading
 from pathlib import Path
+from types import SimpleNamespace
+import time
 
 import pandas as pd
 import yaml
@@ -27,6 +31,54 @@ from utils.performance_logger import PerfListener, log_progress_periodically
 from utils.schema_helpers import bronze_target_columns, infer_schema_from_cdc_event
 
 _DBT_LOCK = threading.Lock()  # serialize dbt runs during streaming
+
+
+# ----------- global runtime for graceful shutdown -------------------
+RUN = SimpleNamespace(stop_event= None, query=None, cdc_thread=None)
+
+def _graceful_shutdown(signum=None, frame=None):
+    """Handle SIGTERM/SIGINT and atexit: stop CDC + drain/stop Spark cleanly."""
+    try:
+        log.info(f"[SHUTDOWN] signal={signum} received, draining ......")
+    except Exception:
+        pass
+
+    try:
+        if RUN.stop_event is not None:
+            RUN.stop_event.set()
+    except Exception:
+        pass
+
+    q = getattr(RUN, "query", None)
+    if q is not None:
+        try:
+            if q.isActive:
+                q.stop() # drain in-flight micro batches
+        except Exception as e:
+            try:
+                log.warning(f"[SHUTDOWN] query.stop() failed: {e}]")
+            except Exception:
+                pass
+
+    try:
+        from pyspark.sql import SparkSession
+        spark = SparkSession.getActiveSession()
+        if spark is not None:
+            spark.stop()
+    except Exception:
+        pass
+
+    try:
+        t = getattr(RUN, "cdc_thread", None)
+        if t is not None and t.is_alive():
+            t.join(timeout=20)
+    except Exception:
+        pass
+
+# register handlers early to catch signals during bootstrap
+signal.signal(signal.SIGTERM, _graceful_shutdown)
+signal.signal(signal.SIGINT,  _graceful_shutdown)
+atexit.register(_graceful_shutdown)
 
 
 class _SingletonRunLock():
@@ -590,7 +642,16 @@ def streaming_dv_consumer_and_dbt(models_to_run):
     trigger_every = os.environ.get("STREAM_TRIGGER", "2 seconds")
 
     # Use your unified writer (now fixed to force Delta)
-    def _after_write(tbl: str):
+    # Be tolerant to different callback signatures from bronze_ingestor
+    def _after_write(*args):
+        # Expected: (tbl, batch_id, written); fallback: (tbl,)
+        if not args:
+            return
+        if len(args) >= 1:
+            tbl = args[0]
+        else:
+            return
+
         models = table_to_models.get(tbl, [])
         if models:
             run_dbt_models(models)
@@ -699,20 +760,24 @@ def main():
 
         # -------- Phase 2: Stream up (consumer) --------
         stop_event = threading.Event()
+        RUN.stop_event = stop_event
         query = None
         if processing_mode == "streaming":
-            stream_thread = threading.Thread(
-                target=streaming_dv_consumer_and_dbt,
-                args=(models_to_run,),
-                daemon=True,
-                name="dv-streaming-consumer",
-            )
-            stream_thread.start()
+            # Start stream and keep handle (non-blocking; returns StreamingQuery)
+            query = streaming_dv_consumer_and_dbt(models_to_run)
+            RUN.query = query
+            # Small settle time so Spark attaches before initial production
             try:
-                import time
-                time.sleep(2)
+                time.sleep(1)
             except Exception:
                 pass
+            # stream_thread = threading.Thread(
+            #     target=streaming_dv_consumer_and_dbt,
+            #     args=(models_to_run,),
+            #     daemon=True,
+            #     name="dv-streaming-consumer",
+            # )
+            # stream_thread.start()
 
         # -------- Phase 3: Initial full load (backlog) --------
         if processing_mode == 'bulk':
@@ -759,7 +824,7 @@ def main():
 
             # 3) gate on Spark seeing the growth
             from utils.helper_service_ready import wait_for_stream_offset_growth
-            q = get_active_stream_query_by_name("lake_stream-generic-ingestor")  # small helper you add
+            q = get_active_stream_query_by_name("lake_stream-generic-ingestor") or query # small helper you add
             if q:
                 wait_for_stream_offset_growth(q, produced_total=produced_total,base_total=base_total, timeout_sec=60)
                 log.info("[STREAM][status] isActive=%s", q.isActive)
@@ -767,26 +832,36 @@ def main():
                 log.info("[STREAM][source-desc] %s", (lp.get("sources", [{}])[0].get("description")))
 
         # -------- Phase 4: Continuous CDC producer (insert-only) --------
-        cdc_thread = threading.Thread(
-            target=cdc_producer_insert_only,
-            daemon=True,
-            name="cdc-insert-only",
-        )
+        def _cdc_loop():
+            try:
+                cdc_producer_insert_only(stop_event=stop_event)
+            except TypeError:
+                cdc_producer_insert_only()
+
+        cdc_thread = threading.Thread(target=_cdc_loop, daemon=False, name="cdc-insert-only")
+        RUN.cdc_thread = cdc_thread
         cdc_thread.start()
+
+        # cdc_thread = threading.Thread(
+        #     target=cdc_producer_insert_only,
+        #     daemon=True,
+        #     name="cdc-insert-only",
+        # )
+        # cdc_thread.start()
 
         # -------- Phase 5: Lifecycle / graceful shutdown --------
         try:
             if query is not None:
+                # Block until SIGTERM/SIGINT or query.stop()
                 query.awaitTermination()
+            else:
+                # Non-streaming mode: idle but responsive to signals
+                while not stop_event.is_set():
+                    time.sleep(1)
         except KeyboardInterrupt:
-            log.info("Shutting down CDC producer.")
-            stop_event.set()
-            if query is not None:
-                try:
-                    query.stop()
-                except Exception:
-                    pass
-            log.info("All done.")
+            _graceful_shutdown()
+        finally:
+            _graceful_shutdown()
 
 
 if __name__ == "__main__":
