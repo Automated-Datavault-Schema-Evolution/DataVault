@@ -490,6 +490,9 @@ def streaming_dv_consumer_and_dbt(models_to_run):
 
     checkpoint_root = os.environ.get("CHECKPOINT_PATH", "/data/checkpoints")
     checkpoint_dir = os.path.join(checkpoint_root, f"{KAFKA_TOPIC}_generic_v3")
+
+
+    ## TODO: ONLY FOR TESTING, REMOVE BEFORE DEPLOYMENT
     if os.environ.get("STREAM_CHECKPOINT_RESET", "").lower() in {"1", "true", "yes"}:
         log.warning("[STREAM] Wiping checkpoint dir: %s", checkpoint_dir)
         shutil.rmtree(checkpoint_dir, ignore_errors=True)
