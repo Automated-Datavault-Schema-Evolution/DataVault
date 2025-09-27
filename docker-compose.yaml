@@ -4,6 +4,10 @@ configs:
 
 services:
   datavault-ingestion-app:
+    # user: "185:185"
+    # group_add:
+    #   - "1001"
+    user: "1001:1001"
     build:
       context: .
       dockerfile: Dockerfile
@@ -15,36 +19,63 @@ services:
       - ./:/app
       - ${HOST_DATA_DIRECTORY}:${CONTAINER_DATA_DIR}
       - /var/run/docker.sock:/var/run/docker.sock
+      - delta-jars:/opt/delta-jars:ro
+      - ext-jars:/opt/ext-jars:ro
+      - jdbc-driver:/opt/jdbc-jars:ro
+      - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
     networks:
       - data-automation-net
     environment:
       - SSH_AUTH_SOCK=/ssh-agent
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092 #change hardcoded variable, to dynamic from env-file (currently hardcoded, as it would use localhost:9092 in docker)
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - UMASK=0002
+      - SPARK_WORKER_OPTS=-Dspark.hadoop.fs.permissions.umask-mode=002
+      - HOME=/tmp
+      - SPARK_IVY_PATH=/tmp/.ivy2
+      - CHECKPOINT_PATH=${CHECKPOINT_PATH}            # -> /data/checkpoints
+      - SPARK_SQL_WAREHOUSE_DIR=${CONTAINER_WAREHOUSE_DIR}  # -> /data/spark/warehouse
     restart: unless-stopped
+    ports:
+      - "4042:4042"
     depends_on:
       datavault-ingestion-spark-master:
         condition: service_healthy
       datavault-ingestion-spark-thrift:
         condition: service_healthy
+      kafka-jars-init:
+        condition: service_completed_successfully
+      warehouse-init:
+        condition: service_completed_successfully
 
 
   datavault-ingestion-spark-master:
+    user: "1001:1001"
     image: ${SPARK_WORKER_IMAGE}
     container_name: datavault-ingestion-spark-master
     depends_on:
       hive-jars-init:
-        condition: service_started
+        condition: service_completed_successfully
       hive-metastore:
         condition: service_healthy
+      warehouse-init:
+        condition: service_completed_successfully
+      kafka-jars-init:
+        condition: service_completed_successfully
     environment:
       - SPARK_MODE=master
       - SPARK_MASTER_PORT=7078
       - SPARK_MASTER_WEBUI_PORT=8081
       - KAFKA_BOOTSTRAP_SERVER=kafka:9092
+      - SPARK_CLASSPATH=/opt/delta-jars/*:/opt/ext-jars/*
+      - UMASK=0002
+      - SPARK_MASTER_OPTS=-Dspark.hadoop.fs.permissions.umask-mode=002
     volumes:
-      - ${HOST_DATA_DIRECTORY}:/data
+      - ${HOST_DATA_DIRECTORY}:${CONTAINER_DATA_DIR}
+      - ${HOST_SPARK_WAREHOUSE_DIR}:${CONTAINER_WAREHOUSE_DIR}
       - hive-313-jars:/opt/hive-3.1.3-lib:ro
-      - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
+      - ./hive-site.xml:/opt/bitnami/spark/conf/hive-site.xml:ro
+      - delta-jars:/opt/delta-jars:ro
+      - ext-jars:/opt/ext-jars:ro
     ports:
       - "7078:7078"
       - "8081:8081"
@@ -60,14 +91,18 @@ services:
       start_period: 5s
 
   datavault-ingestion-spark-worker-1:
-    # image: apache/spark:3.5.6
+    user: "1001:1001"
     image: ${SPARK_WORKER_IMAGE}
     container_name: datavault-ingestion-spark-worker-1
     depends_on:
       datavault-ingestion-spark-master:
         condition: service_healthy
       hive-jars-init:
-        condition: service_started
+        condition: service_completed_successfully
+      kafka-jars-init:
+        condition: service_completed_successfully
+      warehouse-init:
+        condition: service_completed_successfully
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://datavault-ingestion-spark-master:7078
@@ -75,10 +110,16 @@ services:
       - SPARK_WORKER_CORES=${SPARK_EXECUTOR_CORES}
       - SPARK_WORKER_WEBUI_PORT=8084
       - KAFKA_BOOTSTRAP_SERVER=kafka:9092
+      - SPARK_CLASSPATH=/opt/delta-jars/*:/opt/ext-jars/*
+      - UMASK=0002
+      - SPARK_WORKER_OPTS=-Dspark.hadoop.fs.permissions.umask-mode=002
     volumes:
       - ${HOST_DATA_DIRECTORY}:${CONTAINER_DATA_DIR}
+      - ${HOST_SPARK_WAREHOUSE_DIR}:${CONTAINER_WAREHOUSE_DIR}
       - hive-313-jars:/opt/hive-3.1.3-lib:ro
-      - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
+      - ./hive-site.xml:/opt/bitnami/spark/conf/hive-site.xml:ro
+      - delta-jars:/opt/delta-jars:ro
+      - ext-jars:/opt/ext-jars:ro
     ports: [ "8084:8084" ]
     networks:
       - data-automation-net
@@ -90,21 +131,18 @@ services:
       start_period: 5s
 
   datavault-ingestion-spark-worker-2:
+    user: "1001:1001"
     image: ${SPARK_WORKER_IMAGE}
     container_name: datavault-ingestion-spark-worker-2
     depends_on:
       datavault-ingestion-spark-master:
         condition: service_healthy
       hive-jars-init:
-        condition: service_started
-    # command: >
-    #   bash -lc "
-    #     /opt/spark/sbin/start-worker.sh
-    #       spark://datavault-ingestion-spark-master:7078
-    #       --webui-port 8085
-    #       --cores ${SPARK_EXECUTOR_CORES}
-    #       --memory ${SPARK_EXECUTOR_MEMORY}
-    #     && tail -f /opt/spark/logs/*"
+        condition: service_completed_successfully
+      kafka-jars-init:
+        condition: service_completed_successfully
+      warehouse-init:
+        condition: service_completed_successfully
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://datavault-ingestion-spark-master:7078
@@ -112,10 +150,16 @@ services:
       - SPARK_WORKER_CORES=${SPARK_EXECUTOR_CORES}
       - SPARK_WORKER_WEBUI_PORT=8085
       - KAFKA_BOOTSTRAP_SERVER=kafka:9092
+      - SPARK_CLASSPATH=/opt/delta-jars/*:/opt/ext-jars/*
+      - UMASK=0002
+      - SPARK_WORKER_OPTS=-Dspark.hadoop.fs.permissions.umask-mode=002
     volumes:
       - ${HOST_DATA_DIRECTORY}:${CONTAINER_DATA_DIR}
+      - ${HOST_SPARK_WAREHOUSE_DIR}:${CONTAINER_WAREHOUSE_DIR}
       - hive-313-jars:/opt/hive-3.1.3-lib:ro
-      - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
+      - ./hive-site.xml:/opt/bitnami/spark/conf/hive-site.xml:ro
+      - delta-jars:/opt/delta-jars:ro
+      - ext-jars:/opt/ext-jars:ro
     ports: [ "8085:8085" ]
     networks:
       - data-automation-net
@@ -128,24 +172,35 @@ services:
 
 
   datavault-ingestion-spark-worker-thrift:
+    user: "1001:1001"
     image: ${SPARK_WORKER_IMAGE}
     container_name: datavault-ingestion-spark-worker-thrift
     depends_on:
       datavault-ingestion-spark-master:
         condition: service_healthy
       hive-jars-init:
-        condition: service_started
+        condition: service_completed_successfully
+      kafka-jars-init:
+        condition: service_completed_successfully
+      warehouse-init:
+        condition: service_completed_successfully
     environment:
       - SPARK_MODE=worker
-      - SPARK_WORKER_CORES=2
-      - SPARK_WORKER_MEMORY=4g
-      - SPARK_WORKER_PORT=18081
-      - SPARK_WORKER_WEBUI_PORT=18082
       - SPARK_MASTER_URL=spark://datavault-ingestion-spark-master:7078
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=4
+      - SPARK_WORKER_WEBUI_PORT=18082
+      - KAFKA_BOOTSTRAP_SERVER=kafka:9092
+      - SPARK_CLASSPATH=/opt/delta-jars/*:/opt/ext-jars/*
+      - UMASK=0002
+      - SPARK_WORKER_OPTS=-Dspark.hadoop.fs.permissions.umask-mode=002
     volumes:
       - ${HOST_DATA_DIRECTORY}:${CONTAINER_DATA_DIR}
+      - ${HOST_SPARK_WAREHOUSE_DIR}:${CONTAINER_WAREHOUSE_DIR}
       - hive-313-jars:/opt/hive-3.1.3-lib:ro
-      - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
+      - ./hive-site.xml:/opt/bitnami/spark/conf/hive-site.xml:ro
+      - delta-jars:/opt/delta-jars:ro
+      - ext-jars:/opt/ext-jars:ro
     ports: [ "18082:18082" ]
     networks:
       - data-automation-net
@@ -158,6 +213,8 @@ services:
 
 
   datavault-ingestion-spark-thrift:
+    # user: "1001:1001"
+    user: "0:0"
     image: apache/spark:3.5.6
     container_name: datavault-ingestion-spark-thrift
     depends_on:
@@ -168,40 +225,87 @@ services:
       datavault-ingestion-spark-worker-2:
         condition: service_healthy
       hive-jars-init:
-        condition: service_started
+        condition: service_completed_successfully
       hive-metastore:
         condition: service_healthy
-    command: >
-      bash -lc "
-        /opt/spark/sbin/start-thriftserver.sh
-          --master spark://datavault-ingestion-spark-master:7078
-          --hiveconf hive.server2.thrift.bind.host=0.0.0.0
-          --hiveconf hive.server2.thrift.port=10000
-          --conf spark.sql.catalogImplementation=hive
-          --conf spark.executor.instances=1
-          --conf spark.executor.cores=2
-          --conf spark.executor.memory=3g
-          --conf spark.cores.max=2
-          --conf spark.deploy.spreadOut=false
-          --conf spark.ui.showConsoleProgress=false
-          --conf spark.sql.warehouse.dir=/data/spark/warehouse
-          --conf spark.sql.hive.metastore.uris=thrift://hive-metastore:9083
-          --conf spark.sql.hive.metastore.version=3.1.3
-          --conf spark.sql.hive.metastore.jars=/opt/hive-3.1.3-lib/*
-          --conf spark.ui.enabled=false
-        && tail -f /opt/spark/logs/*"
+      delta-jars-init:
+        condition: service_completed_successfully
+      kafka-jars-init:
+        condition: service_completed_successfully
+      warehouse-init:
+        condition: service_completed_successfully
     environment:
-      - SPARK_NO_DAEMONIZE=true
-      - CONTAINER_DATA_DIR=${CONTAINER_DATA_DIR}
-      - CONTAINER_WAREHOUSE_DIR=${CONTAINER_WAREHOUSE_DIR}
+      - SPARK_CLASSPATH=/opt/delta-jars/*:/opt/ext-jars/*
+      - HOME=/tmp
+      - SPARK_IVY_PATH=/tmp/.ivy2
+      - SPARK_SQL_WAREHOUSE_DIR=${CONTAINER_WAREHOUSE_DIR}
+    command:
+      - bash
+      - -lc
+      - |
+        set -Eeuo pipefail
+
+        # Sanity: jars present
+        ls -l /opt/delta-jars /opt/ext-jars || true
+        test -s /opt/delta-jars/delta-spark_2.12-3.3.0.jar
+        test -s /opt/delta-jars/delta-storage-3.3.0.jar
+        test -s /opt/ext-jars/spark-sql-kafka-0-10_2.12-3.5.6.jar
+        test -s /opt/ext-jars/spark-token-provider-kafka-0-10_2.12-3.5.6.jar
+        test -s /opt/ext-jars/kafka-clients-3.5.1.jar
+
+        # Put Delta on Spark's core classpath for the Thrift JVM
+        # cp -f /opt/delta-jars/delta-spark_2.12-3.3.0.jar /opt/spark/jars/
+        # cp -f /opt/delta-jars/delta-storage-3.3.0.jar    /opt/spark/jars/
+
+        # Ensure warehouse + hive scratch/staging are present & writable
+        mkdir -p /data/spark/warehouse /tmp/hive-scratch /tmp/hive-staging
+        # keep writers compatible with Bitnami workers (UID 1001)
+        # chown -R 1001:1001 /data/spark/warehouse /tmp/hive-scratch /tmp/hive-staging
+        chmod -R g+rwX /data/spark/warehouse /tmp/hive-scratch /tmp/hive-staging
+        find /data/spark/warehouse -type d -exec chmod g+s {} +
+        umask 0002
+
+        /opt/spark/sbin/start-thriftserver.sh \
+          --master spark://datavault-ingestion-spark-master:7078 \
+          --hiveconf hive.server2.thrift.bind.host=0.0.0.0 \
+          --hiveconf hive.server2.thrift.port=10000 \
+          --hiveconf hive.exec.scratchdir=/tmp/hive-scratch \
+          --hiveconf hive.exec.stagingdir=/tmp/hive-staging \
+          --jars /opt/ext-jars/spark-sql-kafka-0-10_2.12-3.5.6.jar,/opt/ext-jars/spark-token-provider-kafka-0-10_2.12-3.5.6.jar,/opt/ext-jars/kafka-clients-3.5.1.jar, /opt/delta-jars/delta-spark_2.12-3.3.0.jar, /opt/delta-jars/delta-storage-3.3.0.jar \
+          --conf spark.jars.ivy=/tmp/.ivy2 \
+          --conf spark.driver.extraJavaOptions="-Duser.home=/tmp" \
+          --conf spark.executor.extraJavaOptions="-Duser.home=/tmp" \
+          --conf spark.driver.extraClassPath=/opt/delta-jars/delta-spark_2.12-3.3.0.jar:/opt/delta-jars/delta-storage-3.3.0.jar \
+          --conf spark.executor.extraClassPath=/opt/delta-jars/delta-spark_2.12-3.3.0.jar:/opt/delta-jars/delta-storage-3.3.0.jar \
+          --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+          --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+          --conf spark.sql.sources.default=delta \
+          --conf spark.sql.warehouse.dir=/data/spark/warehouse \
+          --conf spark.hadoop.hive.exec.scratchdir=/tmp/hive-scratch \
+          --conf spark.hadoop.hive.exec.stagingdir=/tmp/hive-staging \
+          --conf spark.sql.hive.metastore.uris=thrift://hive-metastore:9083 \
+          --conf spark.sql.hive.metastore.version=3.1.3 \
+          --conf spark.sql.hive.metastore.jars=/opt/hive-3.1.3-lib/* \
+          --conf spark.ui.enabled=true \
+          --conf spark.cores.max=4 \
+          --conf spark.executor.instances=1 \
+          --conf spark.executor.cores=4 \
+          --conf spark.executor.memory=1g \
+          --conf spark.deploy.spreadOut=false \
+          --conf spark.hadoop.fs.permissions.umask-mode=002 \
+          --conf spark.local.dir=/tmp
+        tail -F /opt/spark/logs/* &
+        wait -n
+
     volumes:
       - ${HOST_DATA_DIRECTORY}:${CONTAINER_DATA_DIR}
       - ${HOST_SPARK_WAREHOUSE_DIR}:${CONTAINER_WAREHOUSE_DIR}
       - hive-313-jars:/opt/hive-3.1.3-lib:ro
+      - delta-jars:/opt/delta-jars:ro
+      - ext-jars:/opt/ext-jars:ro
       - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
     ports: [ "10000:10000" ]
-    networks:
-      - data-automation-net
+    networks: [ data-automation-net ]
     healthcheck:
       test: [ "CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/10000 && exec 3>&- 3<&- || exit 1'" ]
       interval: 5s
@@ -212,7 +316,7 @@ services:
 
   hive-jars-init:
     image: apache/hive:3.1.3
-    user: "0"
+    user: "0:0"
     container_name: hive-jars-init
     entrypoint:
       - /bin/bash
@@ -222,7 +326,7 @@ services:
         rm -rf /hive-jars/*
         cp -a /opt/hive/lib/* /hive-jars/
         touch /hive-jars/.ready
-        sleep infinity
+        # sleep infinity
     volumes:
       - hive-313-jars:/hive-jars
     networks:
@@ -230,7 +334,7 @@ services:
 
   jdbc-driver-init:
     image: curlimages/curl:8.10.1
-    user: "0"
+    user: "0:0"
     entrypoint:
       - sh
       - -lc
@@ -240,12 +344,70 @@ services:
         -o /out/postgresql-42.7.4.jar
         https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar;
         ls -l /out
+    depends_on:
+      warehouse-init:
+        condition: service_completed_successfully
     volumes:
       - jdbc-driver:/out
     networks:
       - data-automation-net
 
+  delta-jars-init:
+    image: curlimages/curl:8.10.1
+    user: "0:0"
+    entrypoint:
+      - sh
+      - -lc
+      - |
+        set -Eeuo pipefail
+        mkdir -p /out
+        echo "Downloading Delta jars to /out ..."
+        curl -fL --retry 5 --retry-all-errors \
+          -o /out/delta-spark_2.12-3.3.0.jar \
+          https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.3.0/delta-spark_2.12-3.3.0.jar
+        curl -fL --retry 5 --retry-all-errors \
+          -o /out/delta-storage-3.3.0.jar \
+          https://repo1.maven.org/maven2/io/delta/delta-storage/3.3.0/delta-storage-3.3.0.jar
+        ls -l /out
+        # stay up for debugging; remove 'sleep' if you don't need it
+        # sleep infinity
+    volumes:
+      - delta-jars:/out
+    networks: [ data-automation-net ]
+
+  kafka-jars-init:
+    image: curlimages/curl:8.10.1
+    user: "0:0"
+    entrypoint:
+      - sh
+      - -lc
+      - |
+        set -Eeuo pipefail
+        mkdir -p /out
+        echo "Downloading Kafka connector jars to /out ..."
+        curl -fL --retry 5 --retry-all-errors \
+          -o /out/spark-sql-kafka-0-10_2.12-3.5.6.jar \
+          https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.6/spark-sql-kafka-0-10_2.12-3.5.6.jar
+        curl -fL --retry 5 --retry-all-errors \
+          -o /out/spark-token-provider-kafka-0-10_2.12-3.5.6.jar \
+          https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.5.6/spark-token-provider-kafka-0-10_2.12-3.5.6.jar
+        curl -fL --retry 5 --retry-all-errors \
+          -o /out/kafka-clients-3.5.1.jar \
+          https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.5.1/kafka-clients-3.5.1.jar
+        curl -fL --retry 5 --retry-all-errors \
+          -o /out/commons-pool2-2.12.1.jar \
+          https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.12.1/commons-pool2-2.12.1.jar
+        ls -l /out
+        # sleep infinity   # uncomment if you want container to stay alive for debugging
+    volumes:
+      - ext-jars:/out
+    depends_on:
+      warehouse-init:
+        condition: service_completed_successfully
+    networks: [ data-automation-net ]
+
   metastore-db-init:
+    user: "0:0"
     image: postgres:latest
     environment:
       PGHOST: postgres
@@ -280,7 +442,7 @@ services:
 
   hive-schema-init:
     image: apache/hive:3.1.3
-    user: "0"
+    user: "0:0"
     entrypoint:
       - /bin/bash
       - -lc
@@ -297,6 +459,8 @@ services:
         condition: service_completed_successfully
       metastore-db-init:
         condition: service_completed_successfully
+      warehouse-init:
+        condition: service_completed_successfully
     volumes:
       - jdbc-driver:/opt/hive/extra-jars:ro
       - ./hive-site.xml:/opt/hive/conf/hive-site.xml:ro
@@ -305,7 +469,7 @@ services:
 
   hive-metastore:
     image: apache/hive:3.1.3
-    user: "0"
+    user: "0:0"
     environment:
       METASTORE_DB: ${METASTORE_DB}
       METASTORE_DB_USER: ${METASTORE_DB_USER}
@@ -323,7 +487,7 @@ services:
         /opt/hive/bin/schematool -dbType postgres -driver org.postgresql.Driver \
           -userName "${METASTORE_DB_USER}" -passWord "${METASTORE_DB_PASSWORD}" \
           -url "jdbc:postgresql://postgres:5432/${METASTORE_DB}?currentSchema=public" -info -verbose;
-        echo "[start] launching Hive Metastore on :9083";
+        echo "[start] launching Hive Metastore on :9083 (bind 0.0.0.0)";
         exec /opt/hive/bin/hive --service metastore -p 9083 \
           --hiveconf javax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/${METASTORE_DB}?currentSchema=public \
           --hiveconf javax.jdo.option.ConnectionUserName=${METASTORE_DB_USER} \
@@ -337,25 +501,45 @@ services:
     depends_on:
       hive-schema-init:
         condition: service_completed_successfully
-    # Healthcheck without nc (uses bash's /dev/tcp)
+      warehouse-init:
+        condition: service_completed_successfully
     healthcheck:
       test: [ "CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/9083 && exec 3>&- 3<&- || exit 1'" ]
       interval: 5s
       timeout: 5s
       retries: 30
-      start_period: 10s
+      start_period: 15s
     ports: [ "9083:9083" ]
     networks:
       - data-automation-net
     restart: unless-stopped
 
+  warehouse-init:
+    image: bash:5.2
+    user: "0:0"
+    command: >
+      bash -lc '
+        set -Eeuo pipefail
+        mkdir -p /data/raw_vault /data/checkpoints /data/spark/warehouse
+        chown -R 1001:1001 /data
+        find /data -type d -exec chmod 2775 {} \;
+        find /data -type f -exec chmod 664 {} \;
+      '
+    volumes:
+      - ${HOST_DATA_DIRECTORY}:/data
+      - ${HOST_SPARK_WAREHOUSE_DIR}:/data/spark/warehouse
+    networks: [ data-automation-net ]
+    restart: "no"
 
 
 volumes:
-  # spark-warehouse:
   hive-313-jars: {}
-  ext-jars:
+  ext-jars: {}
   jdbc-driver: {}
+  spark-ivy-cache: {}
+  delta-jars: {}
+  bronze-data:
+  spark-checkpoints:
 
 networks:
   data-automation-net:

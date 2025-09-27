@@ -1,11 +1,12 @@
+import fcntl
 import json
 import os
 import subprocess
 import threading
+from pathlib import Path
 
 import pandas as pd
 import yaml
-import fcntl
 from jinja2 import Template
 from logger import log
 from pyhive import hive
@@ -16,22 +17,23 @@ from config import (
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
     RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, DBT_MODELS_SQL_DIR,
     KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID, STAGING_SCHEMA, RAW_VAULT_SCHEMA, PROCESSING_MODE,
-    KAFKA_MAX_OFFSETS_PER_TRIGGER, )
+    KAFKA_MAX_OFFSETS_PER_TRIGGER, RAW_VAULT_BASE_PATH, )
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
-from utils.bronze_ingestor import ensure_bronze_table_exists
-from utils.helper_service_ready import wait_for_lake, wait_for_kafka, wait_for_kafka_increase, \
-    wait_for_stream_offset_growth
-from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir
+from utils.bronze_ingestor import ensure_bronze_table_exists, start_bronze_writer
+from utils.helper_service_ready import wait_for_lake, wait_for_kafka, wait_for_kafka_increase
+from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir, get_active_stream_query_by_name
 from utils.performance_logger import PerfListener, log_progress_periodically
 from utils.schema_helpers import bronze_target_columns, infer_schema_from_cdc_event
 
 _DBT_LOCK = threading.Lock()  # serialize dbt runs during streaming
 
+
 class _SingletonRunLock():
     """
     Best-effort singelton run guard to avoid two orchestrators booting oncurrently.
     """
+
     def __init__(self, path="/tmp/dv_orchestrator.lock"):
         self.path = path
         self._fh = None
@@ -148,84 +150,162 @@ def discover_lake():
 
     return tables, load_table
 
+
 def ensure_database_schema():
-    """Create target Spark database/schema if it does not exist."""
+    """Create target Spark database/schema with a LOCATION if configured."""
     profiles_yml_path = os.path.join(DBT_PROFILES_DIR, "profiles.yml")
     if not os.path.exists(profiles_yml_path):
         return
+
     with open(profiles_yml_path, "r") as f:
         profiles = yaml.safe_load(f) or {}
+
     default_profile = profiles.get("default", {})
     target = default_profile.get("target")
     outputs = default_profile.get("outputs", {})
     target_cfg = outputs.get(target, {})
+
     schema = target_cfg.get("schema") or target_cfg.get("database")
     if not schema:
         return
     if "{{" in schema:
         schema = Template(schema).render(env_var=lambda name, default=None: os.getenv(name, default))
+
+    # Map known schemas to their base paths
+
+    schema_locations = {
+        STAGING_SCHEMA: RAW_VAULT_BASE_PATH,
+        RAW_VAULT_SCHEMA: RAW_VAULT_BASE_PATH,
+    }
+    desired_loc = schema_locations.get(schema)
+
     host, port, user = _resolve_thrift(target_cfg)
     conn = hive.Connection(host=host, port=port, username=user)
     cursor = conn.cursor()
-    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {schema}")
+
+    if desired_loc:
+        Path(desired_loc).mkdir(parents=True, exist_ok=True)
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS {schema} LOCATION '{desired_loc}'")
+        log.info(f"[DB] Ensured database/schema '{schema}' exists at {desired_loc}")
+    else:
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS {schema}")
+        log.info(f"[DB] Ensured database/schema '{schema}' exists")
+
+    if desired_loc:
+        cursor.execute(f"DESCRIBE DATABASE EXTENDED {schema}")
+        rows = cursor.fetchall()
+        current_loc = next((r[1] for r in rows if str(r[0]).lower() == "location"), None)
+        if current_loc and current_loc.rstrip("/") != desired_loc.rstrip("/"):
+            cursor.execute(f"ALTER DATABASE {schema} SET LOCATION '{desired_loc}'")
+            log.info(f"[DB] Moved default LOCATION of {schema} to {desired_loc}")
+
     cursor.close()
     conn.close()
-    log.info(f"[DB] Ensured database/schema '{schema}' exists")
 
 
 def write_sql_model_file(model_name, table_name, model_type, meta):
     """Create/update a dbt SQL model file based on JSON metadata (idempotent)."""
     os.makedirs(DBT_MODELS_SQL_DIR, exist_ok=True)
     file_path = os.path.join(DBT_MODELS_SQL_DIR, f"{model_name}.sql")
-    business_keys = meta.get("business_keys", [])
-    attributes = meta.get("attributes", [])
-    columns = business_keys + attributes
 
-    incremental_conf = (
-        "{{ config(\n"
-        "    materialized='incremental',\n"
-        "    incremental_strategy='insert_overwrite',\n"
-        "    on_schema_change='sync_all_columns'\n"
-        ") }}\n"
-    )
+    # --- normalize inputs ---------------------------------------------------
+    mtype = (model_type or "").lower()
+    if mtype in {"satellite", "sat"}:
+        mtype = "sat"
+    elif mtype not in {"hub", "link"}:
+        raise ValueError(f"Unsupported model_type: {model_type!r}")
+
+    business_keys = list(meta.get("business_keys", []))
+    attributes    = list(meta.get("attributes", []))
+
+    # match your sources.yml; change default if yours says 'bronze'
+    src_name = meta.get("source_name") or "staging"
+
+    # --- config block: literal unique_key + merge ---------------------------
+    unique_key = (business_keys + ["hashdiff"]) if mtype == "sat" else business_keys
+    if (mtype in {"hub", "link"}) and not business_keys:
+        raise ValueError(f"{mtype} model requires business_keys")
+
+    config_lines = [
+        "materialized='incremental'",
+        "file_format='delta'",
+        "on_schema_change='append_new_columns'",
+        "incremental_strategy='merge'",
+        f"unique_key={unique_key!r}",              # Python list literal
+        # "partition_by=['load_datetime']",
+    ]
+    incremental_conf = "{{ config(\n  " + ",\n  ".join(config_lines) + "\n) }}\n"
+
+    # helper to keep jinja braces intact (NO f-strings / NO .format)
+    def jinja_source(src, tbl):
+        return "{{ source('" + src + "', '" + tbl + "') }}"
+
+    # --- SELECT -------------------------------------------------------------
     lines = [incremental_conf, "select"]
-    for col in columns:
-        lines.append(f"    {col},")
-    lines.append("    current_timestamp() as load_datetime,")
-    lines.append(f"    '{table_name}' as record_source")
-    lines.append(f"from {{{{ source('staging', '{table_name}') }}}}")
-    if model_type in {"hub", "link"} and business_keys:
-        lines.append(f"group by {', '.join(business_keys)}")
+
+    if mtype in {"hub", "link"}:
+        # keys + audit
+        for k in business_keys:
+            lines.append("    " + k + ",")
+        lines.append("    current_timestamp() as load_datetime,")
+        lines.append("    '" + table_name + "' as record_source")
+        lines.append("from " + jinja_source(src_name, table_name))
+        lines.append("group by " + ", ".join(business_keys))
+
+    else:  # sat
+        # keys + attributes + hashdiff + audit
+        for c in business_keys + attributes:
+            lines.append("    " + c + ",")
+        if attributes:
+            attrs_expr = ", ".join("coalesce(cast(" + c + " as string), '')" for c in attributes)
+            lines.append("    sha2(concat_ws('||', " + attrs_expr + "), 256) as hashdiff,")
+        else:
+            lines.append("    sha2('', 256) as hashdiff,")
+        lines.append("    current_timestamp() as load_datetime,")
+        lines.append("    '" + table_name + "' as record_source")
+        lines.append("from " + jinja_source(src_name, table_name))
 
     content = "\n".join(lines) + "\n"
     wrote = write_text_if_changed(file_path, content)
     if wrote:
+        # keep this an f-string so we can see the real file name
         log.debug(f"[DBT] Wrote SQL model {model_name}.sql")
     return wrote
+
+
 
 
 def write_json_model_file(model_name, table_name, model_type, meta):
     """Persist model metadata as JSON for dbt-spark (idempotent) and sync SQL."""
     os.makedirs(DBT_MODELS_JSON_DIR, exist_ok=True)
     file_path = os.path.join(DBT_MODELS_JSON_DIR, f"{model_name}.json")
+
+    # Normalize type once so JSON + SQL stay consistent
+    mtype = (model_type or "").lower()
+    if mtype in {"satellite", "sat"}:
+        mtype = "sat"
+    elif mtype not in {"hub", "link"}:
+        raise ValueError(f"Unsupported model_type: {model_type!r}")
+
     model_def = {
         "model_name": model_name,
         "table_name": table_name,
-        "model_type": model_type,
-        "business_keys": meta.get("business_keys", []),
-        "attributes": meta.get("attributes", []),
-        "columns": meta.get("columns", []),
+        "model_type": mtype,
+        "business_keys": list(meta.get("business_keys", [])),
+        "attributes": list(meta.get("attributes", [])),
+        "columns": list(meta.get("columns", [])),  # optional, not relied upon
     }
+
     json_txt = json.dumps(model_def, indent=2) + "\n"
     wrote_json = write_text_if_changed(file_path, json_txt)
-    wrote_sql = write_sql_model_file(model_name, table_name, model_type, model_def)
+    wrote_sql  = write_sql_model_file(model_name, table_name, mtype, model_def)
     if wrote_json or wrote_sql:
         write_metadata(model_def)
         write_lineage(
             {
                 "source_table": table_name,
                 "target_model": model_name,
-                "model_type": model_type,
+                "model_type": mtype,
                 "business_keys": model_def["business_keys"],
                 "attributes": model_def["attributes"],
                 "columns": model_def["columns"],
@@ -329,6 +409,7 @@ def ensure_profiles_dir():
     """
     Ensure dbt profiles directory exists in the project and create a default profiles.yml if needed.
     """
+    # TODO: fix the creation of the file if not exists, to create the "real" one, if not shipped
     if not os.path.exists(DBT_PROFILES_DIR):
         os.makedirs(DBT_PROFILES_DIR, exist_ok=True)
         log.info(f"[INFO] Created dbt profiles directory: {DBT_PROFILES_DIR}")
@@ -340,6 +421,17 @@ def ensure_profiles_dir():
             f.write("# Insert your dbt profile config here\n")
         log.info(f"[INFO] Created empty profiles.yml at: {profiles_yml_path}")
 
+def ensure_real_profiles():
+    """
+    Force DBT_PROFILES_DIR to the repo's profiles/ folder.
+    Will override any attempt to create empty profiles.
+    """
+    # Repo root (assuming app runs in /app)
+    repo_profiles = Path(__file__).resolve().parent.parent / "profiles"
+    if not repo_profiles.exists():
+        raise RuntimeError(f"profiles/ directory not found at {repo_profiles}")
+    os.environ["DBT_PROFILES_DIR"] = str(repo_profiles)
+    return repo_profiles
 
 # Spark consumer (Streaming + model generation)
 def get_kafka_stream(spark, table_name, schema):
@@ -349,7 +441,7 @@ def get_kafka_stream(spark, table_name, schema):
         StructField("table", StringType()),
         StructField("payload", StringType()),
         StructField("cdc_type", StringType()),
-        StructField("modified_at", StringType())
+        StructField("cdc_modified_at", StringType())
     ])
     df = (
         spark.readStream
@@ -370,60 +462,56 @@ def get_kafka_stream(spark, table_name, schema):
 def streaming_dv_consumer_and_dbt(models_to_run):
     """
     Generic, schema-late binding Kafka -> Bronze streaming consumer + dbt trigger.
-
-    Fixes:
-      - Remove blocking 'wait for topic' probe (race with topic creation).
-      - Use subscribePattern + fast metadata refresh + partition discovery.
-      - Stable micro-batch trigger so the stream actually fires.
-      - Robust null-safe envelope handling; same helper layout.
+    Writes bronze tables as Delta, auto-creating them, and triggers dbt per touched table.
     """
-    import os, json, re, shutil
+    import os, json, shutil, threading  # FIX: add threading
+    from pyspark.sql import functions as F  # FIX: F used later
     from pyspark.sql.functions import col, from_json
     from pyspark.sql.types import StructType, StructField, StringType
 
-    # --- Spark + listener (existing helpers) ---
     spark = get_spark_session("DataVault_Streaming_Consumer")
+    # (Optional) make Delta the default everywhere
+    try:
+        spark.conf.set("spark.sql.sources.default", "delta")  # FIX: safer default
+        spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+    except Exception:
+        pass
+
     try:
         spark.streams.addListener(PerfListener())
     except Exception as e:
         log.debug("PerfListener attach skipped: %s", e)
 
-    # Make shutdown graceful so we don't corrupt checkpoints
     try:
         spark.conf.set("spark.sql.streaming.stopGracefullyOnShutdown", "true")
     except Exception:
         pass
 
-    # Envelope schema; payload remains a raw JSON string per-table
     envelope_schema = StructType([
         StructField("table", StringType()),
         StructField("payload", StringType()),
         StructField("cdc_type", StringType()),
-        StructField("modified_at", StringType()),
+        StructField("cdc_modified_at", StringType()),
     ])
 
-    # --- Checkpoint management ---
     checkpoint_root = os.environ.get("CHECKPOINT_PATH", "/data/checkpoints")
     checkpoint_dir = os.path.join(checkpoint_root, f"{KAFKA_TOPIC}_generic_v3")
     if os.environ.get("STREAM_CHECKPOINT_RESET", "").lower() in {"1", "true", "yes"}:
         log.warning("[STREAM] Wiping checkpoint dir: %s", checkpoint_dir)
         shutil.rmtree(checkpoint_dir, ignore_errors=True)
 
-    # --- 1) Start a single generic stream (no pre-known schemas) ---
-    # Use subscribePattern so the stream comes up even if the topic is created a bit later,
-    # and refresh Kafka metadata *quickly* to avoid the 5-minute default cache.
     log.info("[STREAM][source] bootstrap=%s topic=%s startingOffsets=earliest", KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC)
     src = (
         spark.readStream
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
         .option("subscribe", KAFKA_TOPIC)
-        .option("startingOffsets", "earliest")              # backlog on first run; checkpoint takes over later
+        .option("startingOffsets", "earliest")
         .option("failOnDataLoss", "false")
-        # FAST metadata refresh / discovery to avoid stalling after topic creation
-        .option("kafka.metadata.max.age.ms", "2000")        # refresh topic metadata ~2s
+        .option("kafka.metadata.max.age.ms", "2000")
         .option("kafka.partition.discovery.interval.ms", "2000")
         .option("kafkaConsumer.pollTimeoutMs", "1000")
+        .option("maxOffsetsPerTrigger", KAFKA_MAX_OFFSETS_PER_TRIGGER)
         .load()
         .select(from_json(col("value").cast("string"), envelope_schema).alias("json"))
         .where(col("json").isNotNull())
@@ -431,21 +519,19 @@ def streaming_dv_consumer_and_dbt(models_to_run):
             col("json.table").alias("table"),
             col("json.payload").alias("payload"),
             col("json.cdc_type").alias("cdc_type"),
-            col("json.modified_at").alias("modified_at"),
+            col("json.cdc_modified_at").alias("cdc_modified_at"),
         )
         .where(col("table").isNotNull())
     )
 
-    # Existing helper: {'accounts': ['hub_account', ...], ...}
     table_to_models = get_existing_model_tables()
 
     def _infer_schema_from_batch(df_tbl):
-        """Infer permissive StructType from one payload row in this micro-batch, else fallback helper."""
-        row = df_tbl.select("payload").limit(1).collect()
-        if not row:
+        rows = df_tbl.select("payload").limit(1).collect()
+        if not rows:
             return None
         try:
-            obj = json.loads(row[0]["payload"])
+            obj = json.loads(rows[0]["payload"])
             return StructType([StructField(k, StringType(), True) for k in obj.keys()])
         except Exception as e:
             log.debug("Inline schema inference failed: %s", e)
@@ -457,29 +543,27 @@ def streaming_dv_consumer_and_dbt(models_to_run):
             log.info("[STREAM][%s][epoch=%s] no schema available; skipping", tbl, epoch_id)
             return
 
-        # 2) ensure bronze.<table> exists
-        ensure_bronze_table_exists(spark, tbl, schema)
-
-        # 3) parse and align columns to destination table if possible
         parsed_tbl = batch_df.select(from_json(col("payload"), schema).alias("r")).select("r.*")
-        target_fq = f"{STAGING_SCHEMA}.{tbl}"
-        try:
-            dest_cols = spark.table(target_fq).columns
-            parsed_tbl = parsed_tbl.select(*dest_cols)
-        except Exception as e:
-            log.debug("[BRONZE][%s] Could not align column order (%s); inserting as-is", tbl, e)
+        parsed_tbl = parsed_tbl.coalesce(8)
 
-        # 4) write into bronze via SQL INSERT (Hive catalog)
         batch_count = parsed_tbl.count()
         if batch_count == 0:
             log.debug("[BRONZE][%s][epoch=%s] 0 rows in this batch", tbl, epoch_id)
             return
 
-        parsed_tbl.createOrReplaceTempView(f"_bronze_batch_{tbl}")
-        spark.sql(f"INSERT INTO {target_fq} SELECT * FROM _bronze_batch_{tbl}")
+        # Always Delta, auto-create
+        target_fq = f"{STAGING_SCHEMA}.{tbl}"
+        (parsed_tbl
+         .withColumn("__ingested_at", F.current_timestamp())
+         .withColumn("__record_source", F.lit("kafka_cdc"))
+         .write
+         .format("delta")  # FIX: force Delta
+         .mode("append")
+         .option("mergeSchema", "true")
+         .saveAsTable(target_fq))  # FIX: auto-create if missing
+
         log.info("[BRONZE][%s][epoch=%s] inserted %s row(s)", tbl, epoch_id, batch_count)
 
-        # 5) run related dbt models and log row counts
         models = table_to_models.get(tbl, [])
         if models:
             run_dbt_models(models)
@@ -489,8 +573,6 @@ def streaming_dv_consumer_and_dbt(models_to_run):
                     if spark.catalog.tableExists(fq):
                         mcnt = spark.table(fq).count()
                         log.info("[RAW_VAULT][%s] row_count=%s", fq, mcnt)
-                    else:
-                        log.info("[RAW_VAULT][%s] not visible yet", fq)
                 except Exception as e:
                     log.debug("[RAW_VAULT][%s] count skipped: %s", fq, e)
 
@@ -508,38 +590,44 @@ def streaming_dv_consumer_and_dbt(models_to_run):
             except Exception as e:
                 log.exception("[STREAM][%s][epoch=%s] processing failed: %s", tbl, epoch_id, e)
 
-    # --- Start the stream (add a real-time trigger so it actually fires) ---
-    trigger_every = os.environ.get("STREAM_TRIGGER", "2 seconds")  # override via env if desired
-    query = (
-        src.writeStream
-        .outputMode("append")
-        .queryName(f"{KAFKA_TOPIC}-generic-ingestor")
-        .option("checkpointLocation", checkpoint_dir)
-        .trigger(processingTime=trigger_every)
-        .foreachBatch(_foreach_batch)
-        .start()
+    trigger_every = os.environ.get("STREAM_TRIGGER", "2 seconds")
+
+    # Use your unified writer (now fixed to force Delta)
+    def _after_write(tbl: str, batch_id: int, written: int):
+        models = table_to_models.get(tbl, [])
+        if models:
+            run_dbt_models(models)
+            for m in models:
+                fq = f"{RAW_VAULT_SCHEMA}.{m}"
+                try:
+                    if spark.catalog.tableExists(fq):
+                        mcnt = spark.table(fq).count()
+                        log.info("[RAW_VAULT][%s] row_count=%s", fq, mcnt)
+                except Exception as e:
+                    log.debug("[RAW_VAULT][%s] count skipped: %s", fq, e)
+
+    allowed_tables = set(table_to_models.keys()) if table_to_models else None
+
+    query = start_bronze_writer(
+        spark=spark,
+        df_stream=src,
+        table_name=None,
+        table_col="table",
+        checkpoint_base=checkpoint_dir,
+        on_after_write=_after_write,
+        allowed_tables=allowed_tables,
+        query_name=f"{KAFKA_TOPIC}-generic-ingestor",
+        trigger_every=trigger_every,
     )
 
     log.info("[STREAM] Query started: id=%s, name=%s, trigger=%s, checkpoint=%s",
              query.id, query.name, trigger_every, checkpoint_dir)
     threading.Thread(target=log_progress_periodically, args=(query,), daemon=True).start()
 
-    # Keep prior behavior: don't upfront-run dbt; we trigger per-batch
     if models_to_run:
         log.info("[DBT] Skipping initial run; will trigger models after first micro-batches.")
 
-    # log.info("Streaming ingestion to bronze is running. Press Ctrl+C to stop.")
-    # try:
-    #     spark.streams.awaitAnyTermination()
-    # finally:
-    #     try:
-    #         q.stop()
-    #     except Exception:
-    #         pass
-    #     log.info("[BRONZE] Stopped streaming query")
-    # Non-blocking: let the caller control lifecycle (await/stop).
     return query
-
 
 
 def bootstrap_bronze(lake_tables, load_table):
@@ -559,10 +647,12 @@ def bootstrap_bronze(lake_tables, load_table):
         except Exception as e:
             log.warning(f"[Bootstrap] Could not precreate bronze.{t}: {e}")
 
+
 def main():
     os.makedirs(DBT_MODELS_JSON_DIR, exist_ok=True)
     ensure_spark_warehouse_dir()
     ensure_profiles_dir()
+    # ensure_real_profiles()
     ensure_database_schema()
 
     # wait for lake readiness before discovery
@@ -603,7 +693,7 @@ def main():
             run_dbt_models(sorted(models_to_run))
 
         # -------- Phase 1: Kafka readiness + topic ensure --------
-        check_and_create_topic() # make sure topic exists before streams/producers
+        check_and_create_topic()  # make sure topic exists before streams/producers
         wait_for_kafka(KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, timeout_sec=60)
 
         # Mode switch for CRON bulk runs
@@ -616,9 +706,16 @@ def main():
         stop_event = threading.Event()
         query = None
         if processing_mode == "streaming":
-            query = streaming_dv_consumer_and_dbt(models_to_run)
+            # query = streaming_dv_consumer_and_dbt(models_to_run)
             # Optional: very short pause to let Spark attach to Kafka before we produce
             # (not strictly required, but avoids a tight race on slow startups)
+            stream_thread = threading.Thread(
+                target=streaming_dv_consumer_and_dbt,
+                args=(models_to_run,),
+                daemon=True,
+                name="dv-streaming-consumer",
+            )
+            stream_thread.start()
             try:
                 import time
                 time.sleep(2)
@@ -634,28 +731,72 @@ def main():
             wait_for_kafka_increase(sum(produced_map.values()), timeout_sec=60)
             return
         else:
+            # 1) Take Kafka baseline BEFORE producing anything
+            from utils.helper_service_ready import kafka_total_end, wait_for_kafka_total_at_least
+            base_total = kafka_total_end(
+                bootstrap=KAFKA_BOOTSTRAP_SERVERS,
+                topic=os.getenv("KAFKA_TOPIC", "lake_stream"),
+            )
+            log.info("[ASSERT][KAFKA_OFFSETS][BASE] bootstrap=%s topic=%s base_total=%s",
+                     KAFKA_BOOTSTRAP_SERVERS, os.getenv("KAFKA_TOPIC", "lake_stream"), base_total)
+
             produced_once = set()
+            produced_total = 0
+
             if tables_needing_initial_load:
                 todo = sorted(list(tables_needing_initial_load))
                 log.info("[INITIAL LOAD] Producing full load for tables: %s", todo)
-                produced_map = produce_tables_once(todo)  # sends historical rows to Kafka; streaming will ingest them
-                produced_total = sum(produced_map.values())
-                # Gate on Kafka offsets and then on Spark’s view of them
-                wait_for_kafka_increase(produced_total, timeout_sec=60)
-                if query is not None:
-                    wait_for_stream_offset_growth(query, produced_total, timeout_sec=60)
+                produced_map = produce_tables_once(todo) or {}  # make sure this returns a dict
+                produced_total += sum(produced_map.values())
                 produced_once |= set(todo)
 
             remaining = [t for t in lake_tables if t not in produced_once]
             if remaining:
-                # In case some lake tables already existed but didn't need DV scaffolding,
-                # still produce their initial backlog now that the stream is attached.
                 log.info("[INITIAL LOAD] Producing full load for remaining tables: %s", remaining)
-                produced_map = produce_tables_once(remaining)
-                produced_total = sum(produced_map.values())
-                wait_for_kafka_increase(produced_total, timeout_sec=60)
-                if query is not None:
-                    wait_for_stream_offset_growth(query, produced_total, timeout_sec=60)
+                produced_map = produce_tables_once(remaining) or {}
+                produced_total += sum(produced_map.values())
+
+            # 2) Gate on Kafka reaching base + produced_total
+            target_total = base_total + produced_total
+            wait_for_kafka_total_at_least(
+                min_total=target_total,
+                timeout_sec=60,
+                bootstrap=KAFKA_BOOTSTRAP_SERVERS,
+                topic=os.getenv("KAFKA_TOPIC", "lake_stream"),
+            )
+
+            # 3) (Optional but recommended) also gate on Spark seeing the growth
+            # If you can get a handle to the streaming query, use:
+            from utils.helper_service_ready import wait_for_stream_offset_growth
+            q = get_active_stream_query_by_name("lake_stream-generic-ingestor")  # small helper you add
+            if q:
+                wait_for_stream_offset_growth(q, produced_total, timeout_sec=60)
+                log.info("[STREAM][status] isActive=%s", q.isActive)
+                lp = q.lastProgress or {}
+                log.info("[STREAM][source-desc] %s", (lp.get("sources", [{}])[0].get("description")))
+
+            # produced_once = set()
+            # if tables_needing_initial_load:
+            #     todo = sorted(list(tables_needing_initial_load))
+            #     log.info("[INITIAL LOAD] Producing full load for tables: %s", todo)
+            #     produced_map = produce_tables_once(todo)  # sends historical rows to Kafka; streaming will ingest them
+            #     produced_total = sum(produced_map.values())
+            #     # Gate on Kafka offsets and then on Spark’s view of them
+            #     wait_for_kafka_increase(produced_total, timeout_sec=60)
+            #     if query is not None:
+            #         wait_for_stream_offset_growth(query, produced_total, timeout_sec=60)
+            #     produced_once |= set(todo)
+        #
+        # remaining = [t for t in lake_tables if t not in produced_once]
+        # if remaining:
+        #     # In case some lake tables already existed but didn't need DV scaffolding,
+        #     # still produce their initial backlog now that the stream is attached.
+        #     log.info("[INITIAL LOAD] Producing full load for remaining tables: %s", remaining)
+        #     produced_map = produce_tables_once(remaining)
+        #     produced_total = sum(produced_map.values())
+        #     wait_for_kafka_increase(produced_total, timeout_sec=60)
+        #     if query is not None:
+        #         wait_for_stream_offset_growth(query, produced_total, timeout_sec=60)
 
         # -------- Phase 4: Continuous CDC producer (insert-only) --------
         cdc_thread = threading.Thread(
@@ -678,6 +819,7 @@ def main():
                 except Exception:
                     pass
             log.info("All done.")
+
 
 if __name__ == "__main__":
     main()

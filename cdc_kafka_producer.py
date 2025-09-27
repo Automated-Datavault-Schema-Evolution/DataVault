@@ -19,7 +19,8 @@ from utils.helper_spark import get_spark_session
 from utils.performance_logger import PerfListener
 from utils.schema_helpers import introspect_lake_columns
 
-WATERMARK_FILE = "cdc_watermarks.json"
+WATERMARK_FILE = "/data/state/cdc_watermarks.json"
+WATERMARK_DIR  = os.path.dirname(WATERMARK_FILE)
 
 def build_initial_load_sql(table: str) -> str:
     # Use only real columns from the lake
@@ -132,38 +133,53 @@ def load_rdbms_table(table_name):
 
 
 def load_watermarks():
-    if os.path.exists(WATERMARK_FILE):
-        log.debug(f"Loading watermarks from {WATERMARK_FILE}")
-        try:
-            with open(WATERMARK_FILE, "r") as f:
-                content = f.read().strip()
-                if not content:
-                    log.info(f"Watermark file {WATERMARK_FILE} is empty; starting fresh")
-                    return {}
-                raw = json.loads(content)
-                parsed = {}
-                for tbl, ts in raw.items():
-                    parsed_ts = pd.to_datetime(ts, errors="coerce")
-                    if pd.isna(parsed_ts):
-                        log.warning(f"Ignoring invalid watermark for {tbl}: {ts}")
-                    else:
-                        parsed[tbl] = parsed_ts
-                return parsed
-        except (OSError, json.JSONDecodeError) as e:
-            log.warning(f"Could not parse watermark file {WATERMARK_FILE}: {e}; starting fresh")
-            return {}
-    log.info("No watermark file found; starting fresh")
-    return {}
+    """Load watermarks from disk, tolerating empty/malformed files."""
+    if not os.path.exists(WATERMARK_FILE):
+        log.info("No watermark file found; starting fresh")
+        return {}
+    log.debug(f"Loading watermarks from {WATERMARK_FILE}")
+    try:
+        with open(WATERMARK_FILE, "r") as f:
+            content = f.read().strip()
+            if not content:
+                log.info(f"Watermark file {WATERMARK_FILE} is empty; starting fresh")
+                return {}
+            raw = json.loads(content)
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning(f"Could not parse watermark file {WATERMARK_FILE}: {e}; starting fresh")
+        return {}
+
+    parsed = {}
+    for tbl, ts in raw.items():
+        parsed_ts = pd.to_datetime(ts, errors="coerce", utc=True)
+        if pd.isna(parsed_ts):
+            log.warning(f"Ignoring invalid watermark for {tbl}: {ts}")
+        else:
+            parsed[tbl] = parsed_ts
+    return parsed
 
 
-def save_watermarks(wm):
+def save_watermarks(wm: dict):
+    """Atomically persist watermarks (avoid partial/corrupt files)."""
+    os.makedirs(WATERMARK_DIR, exist_ok=True)
     serializable = {}
     for tbl, ts in wm.items():
         if ts is None or pd.isna(ts):
             continue
-        serializable[tbl] = str(ts)
-    with open(WATERMARK_FILE, "w") as f:
+        # ensure string in ISO 8601 with Z when UTC
+        if isinstance(ts, pd.Timestamp):
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            serializable[tbl] = ts.isoformat()
+        else:
+            serializable[tbl] = str(ts)
+
+    tmp_path = WATERMARK_FILE + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(serializable, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, WATERMARK_FILE)
 
 
 def produce_tables_once(tables):
@@ -186,43 +202,57 @@ def produce_tables_once(tables):
         raise ValueError("Unknown LAKE_TYPE (must be 'parquet' or 'rdbms')")
 
     watermarks = load_watermarks()
-    produced_counts : dict[str, int] = {}
+    produced_counts: dict[str, int] = {}
+
     for table in tables:
         log.info(f"[CDC Producer] Initial load for {table}")
         try:
             df = load_func(table)
         except Exception as e:
             log.info(f"Error loading {table}: {e}")
+            produced_counts[table] = 0
             continue
+
         if "modified_at" not in df.columns:
             log.warning(f"Table {table} skipped: no 'modified_at' column for CDC.")
+            produced_counts[table] = 0
             continue
+
         df = df.dropna(subset=["modified_at"])
         cnt = 0
         futures = []
+
+        # publish
         for _, row in df.iterrows():
             payload = row.dropna().to_dict()
             modified_at = payload.get("modified_at")
+
+            # normalize to ISO string
             if isinstance(modified_at, pd.Timestamp):
+                if modified_at.tzinfo is None:
+                    modified_at = modified_at.tz_localize("UTC")
                 modified_at = modified_at.isoformat()
+
             payload["modified_at"] = modified_at
-            future = producer.send(
+
+            futures.append(producer.send(
                 KAFKA_TOPIC,
                 {
                     "table": table,
                     "payload": json.dumps(payload, default=str),
                     "cdc_type": "insert",
-                    "modified_at": modified_at,
+                    "cdc_modified_at": modified_at,
                 },
-            )
-            futures.append(future)
+            ))
             cnt += 1
-            # Block until the broker acknowledges all sends (surface any delivery errors)
-            for future in futures:
-                future.get(timeout=30)
-        # if not df.empty:
+
+        # wait once, after all sends (surface delivery errors)
+        for fut in futures:
+            fut.get(timeout=30)
+
         if cnt > 0:
-            max_ts = df["modified_at"].max()
+            # df['modified_at'] may be mixed types; let pandas compute max then normalize
+            max_ts = pd.to_datetime(df["modified_at"], errors="coerce", utc=True).max()
             watermarks[table] = max_ts
             log.info(f"[CDC Producer] Produced {cnt} events for {table}. Watermark: {watermarks.get(table)}")
         else:
@@ -238,7 +268,6 @@ def produce_tables_once(tables):
 
 
 def cdc_producer_insert_only(stop_event=None):
-    # Ensure topic exists and is ready
     check_and_create_topic()
 
     producer = KafkaProducer(
@@ -249,6 +278,7 @@ def cdc_producer_insert_only(stop_event=None):
     )
     log.info(f"[CDC Producer] Insert-only CDC from {LAKE_TYPE.upper()} staging area")
     watermarks = load_watermarks()
+
     stop = stop_event.is_set if stop_event else (lambda: False)
     while not stop():
         if LAKE_TYPE == "parquet":
@@ -260,6 +290,7 @@ def cdc_producer_insert_only(stop_event=None):
         else:
             log.critical(f"Unknown LAKE_TYPE '{LAKE_TYPE}' (must be 'parquet' or 'rdbms')")
             raise ValueError("Unknown LAKE_TYPE (must be 'parquet' or 'rdbms')")
+
         for table in tables:
             log.info(f"[CDC Producer] Scanning {table}")
             try:
@@ -267,35 +298,45 @@ def cdc_producer_insert_only(stop_event=None):
             except Exception as e:
                 log.info(f"Error loading {table}: {e}")
                 continue
+
             if "modified_at" not in df.columns:
                 log.warning(f"Table {table} skipped: no 'modified_at' column for CDC.")
                 continue
+
             last_ts = watermarks.get(table)
             if last_ts is not None and not pd.isna(last_ts):
-                new_rows = df[df["modified_at"] > last_ts]
+                df_ts = pd.to_datetime(df["modified_at"], errors="coerce", utc=True)
+                new_rows = df[df_ts > last_ts]
             else:
                 new_rows = df
+
             if new_rows.empty:
                 continue
+
             new_rows = new_rows.dropna(subset=["modified_at"])
             for _, row in new_rows.iterrows():
                 payload = row.dropna().to_dict()
                 modified_at = payload.get("modified_at")
                 if isinstance(modified_at, pd.Timestamp):
+                    if modified_at.tzinfo is None:
+                        modified_at = modified_at.tz_localize("UTC")
                     modified_at = modified_at.isoformat()
                 payload["modified_at"] = modified_at
+
                 producer.send(
                     KAFKA_TOPIC,
                     {
                         "table": table,
                         "payload": json.dumps(payload, default=str),
                         "cdc_type": "insert",
-                        "modified_at": modified_at
+                        "cdc_modified_at": modified_at
                     }
                 )
-            max_ts = new_rows["modified_at"].max()
+
+            max_ts = pd.to_datetime(new_rows["modified_at"], errors="coerce", utc=True).max()
             watermarks[table] = max_ts
             log.info(f"[CDC Producer] Produced {len(new_rows)} events for {table}. Watermark: {max_ts}")
+
         producer.flush()
         save_watermarks(watermarks)
         time.sleep(5)

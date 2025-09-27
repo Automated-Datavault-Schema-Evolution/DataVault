@@ -13,8 +13,16 @@ default:
       connect_timeout: 10
       retries: 3
       threads: 4
+
+      # Ensures dbt's session has Delta extensions/catalog even if ThriftServer restarts
+      session_properties:
+        spark.sql.extensions: "io.delta.sql.DeltaSparkSessionExtension"
+        spark.sql.catalog.spark_catalog: "org.apache.spark.sql.delta.catalog.DeltaCatalog"
+        spark.sql.sources.default: "delta"
+
+      # Keep these aligned with the server's warehouse & metastore
       spark_conf:
-        hive.metastore.uris: "{{ env_var('METASTORE_URI', 'thrift://host.docker.internal:9083') }}"
+        hive.metastore.uris: "{{ env_var('METASTORE_URI', 'thrift://hive-metastore:9083') }}"
         spark.sql.catalogImplementation: "hive"
-        spark.sql.warehouse.dir: "{{ env_var('CONTAINER_SPARK_WAREHOUSE_DIR', '/data/spark/warehouse') }}"
-        hive.metastore.warehouse.dir: "{{ env_var('CONTAINER_SPARK_WAREHOUSE_DIR', '/data/spark/warehouse') }}"
+        spark.sql.warehouse.dir: "{{ env_var('CONTAINER_WAREHOUSE_DIR', '/data/spark/warehouse') }}"
+        hive.metastore.warehouse.dir: "{{ env_var('CONTAINER_WAREHOUSE_DIR', '/data/spark/warehouse') }}"

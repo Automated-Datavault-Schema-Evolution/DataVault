@@ -1,4 +1,4 @@
-pyspark==3.5.3
+pyspark==3.5.6
 delta-spark==3.3.0
 dbt-core
 dbt-spark[PyHive]

@@ -9,6 +9,14 @@ LAKE_TYPE = os.getenv("LAKE_TYPE", "rdbms")
 PARQUET_PATH = os.getenv("PARQUET_PATH", "parquet_files")
 STAGING_SCHEMA = os.getenv("STAGING_SCHEMA", "bronze")
 RAW_VAULT_SCHEMA = os.getenv("RAW_VAULT_SCHEMA", "raw_vault")
+STAGING_BASE_PATH   = os.environ.get("BRONZE_BASE_PATH", "/data/bronze")
+RAW_VAULT_SCHEMA = "raw_vault"
+RAW_VAULT_BASE_PATH = os.getenv("RAW_VAULT_BASE_PATH", "/data/raw_vault")
+
+# Python executor paths
+DRIVER_PY = os.getenv("DRIVER_PY", "/usr/local/bin/python")
+EXEC_PY = os.getenv("EXEC_PY", "/opt/bitnami/python/bin/python")
+SPARK_IVY_PATH = os.getenv("SPARK_IVY_PATH", "/tmp/.ivy2")
 
 # RDBMS settings
 RDBMS_HOST = os.getenv("POSTGRES_HOST", "localhost")
