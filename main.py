@@ -141,7 +141,6 @@ def discover_lake():
             cols = [desc[0] for desc in cur.description]
             cur.close()
             conn.close()
-            # return a dataframe-like schema descriptor; dv_modeller.extract_metadata handles it
             return pd.DataFrame(columns=cols)
 
         return tables, load_table
@@ -172,7 +171,6 @@ def ensure_database_schema():
         schema = Template(schema).render(env_var=lambda name, default=None: os.getenv(name, default))
 
     # Map known schemas to their base paths
-
     schema_locations = {
         STAGING_SCHEMA: RAW_VAULT_BASE_PATH,
         RAW_VAULT_SCHEMA: RAW_VAULT_BASE_PATH,
@@ -218,7 +216,6 @@ def write_sql_model_file(model_name, table_name, model_type, meta):
     business_keys = list(meta.get("business_keys", []))
     attributes    = list(meta.get("attributes", []))
 
-    # match your sources.yml; change default if yours says 'bronze'
     src_name = meta.get("source_name") or "staging"
 
     # --- config block: literal unique_key + merge ---------------------------
@@ -231,12 +228,11 @@ def write_sql_model_file(model_name, table_name, model_type, meta):
         "file_format='delta'",
         "on_schema_change='append_new_columns'",
         "incremental_strategy='merge'",
-        f"unique_key={unique_key!r}",              # Python list literal
-        # "partition_by=['load_datetime']",
+        f"unique_key={unique_key!r}"
     ]
     incremental_conf = "{{ config(\n  " + ",\n  ".join(config_lines) + "\n) }}\n"
 
-    # helper to keep jinja braces intact (NO f-strings / NO .format)
+    # helper to keep jinja braces intact
     def jinja_source(src, tbl):
         return "{{ source('" + src + "', '" + tbl + "') }}"
 
@@ -293,7 +289,7 @@ def write_json_model_file(model_name, table_name, model_type, meta):
         "model_type": mtype,
         "business_keys": list(meta.get("business_keys", [])),
         "attributes": list(meta.get("attributes", [])),
-        "columns": list(meta.get("columns", [])),  # optional, not relied upon
+        "columns": list(meta.get("columns", [])),
     }
 
     json_txt = json.dumps(model_def, indent=2) + "\n"
@@ -414,7 +410,6 @@ def ensure_profiles_dir():
         os.makedirs(DBT_PROFILES_DIR, exist_ok=True)
         log.info(f"[INFO] Created dbt profiles directory: {DBT_PROFILES_DIR}")
 
-    # (Optional) Create a default profiles.yml if not present
     profiles_yml_path = os.path.join(DBT_PROFILES_DIR, "profiles.yml")
     if not os.path.exists(profiles_yml_path):
         with open(profiles_yml_path, "w") as f:
@@ -470,7 +465,6 @@ def streaming_dv_consumer_and_dbt(models_to_run):
     from pyspark.sql.types import StructType, StructField, StringType
 
     spark = get_spark_session("DataVault_Streaming_Consumer")
-    # (Optional) make Delta the default everywhere
     try:
         spark.conf.set("spark.sql.sources.default", "delta")  # FIX: safer default
         spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
@@ -557,10 +551,10 @@ def streaming_dv_consumer_and_dbt(models_to_run):
          .withColumn("__ingested_at", F.current_timestamp())
          .withColumn("__record_source", F.lit("kafka_cdc"))
          .write
-         .format("delta")  # FIX: force Delta
+         .format("delta")
          .mode("append")
          .option("mergeSchema", "true")
-         .saveAsTable(target_fq))  # FIX: auto-create if missing
+         .saveAsTable(target_fq))
 
         log.info("[BRONZE][%s][epoch=%s] inserted %s row(s)", tbl, epoch_id, batch_count)
 
@@ -593,7 +587,7 @@ def streaming_dv_consumer_and_dbt(models_to_run):
     trigger_every = os.environ.get("STREAM_TRIGGER", "2 seconds")
 
     # Use your unified writer (now fixed to force Delta)
-    def _after_write(tbl: str, batch_id: int, written: int):
+    def _after_write(tbl: str):
         models = table_to_models.get(tbl, [])
         if models:
             run_dbt_models(models)
@@ -637,7 +631,6 @@ def bootstrap_bronze(lake_tables, load_table):
 
     for t in lake_tables:
         # Get column names from the lake; make a simple all-STRING schema for the empty Bronze
-        # df_cols = list(load_table(t).columns)  # returns a pandas df with just columns for RDBMS/parquet loaders
         df_cols = bronze_target_columns(spark, t)
         if not df_cols:
             continue
@@ -652,7 +645,6 @@ def main():
     os.makedirs(DBT_MODELS_JSON_DIR, exist_ok=True)
     ensure_spark_warehouse_dir()
     ensure_profiles_dir()
-    # ensure_real_profiles()
     ensure_database_schema()
 
     # wait for lake readiness before discovery
@@ -706,9 +698,6 @@ def main():
         stop_event = threading.Event()
         query = None
         if processing_mode == "streaming":
-            # query = streaming_dv_consumer_and_dbt(models_to_run)
-            # Optional: very short pause to let Spark attach to Kafka before we produce
-            # (not strictly required, but avoids a tight race on slow startups)
             stream_thread = threading.Thread(
                 target=streaming_dv_consumer_and_dbt,
                 args=(models_to_run,),
@@ -765,8 +754,7 @@ def main():
                 topic=os.getenv("KAFKA_TOPIC", "lake_stream"),
             )
 
-            # 3) (Optional but recommended) also gate on Spark seeing the growth
-            # If you can get a handle to the streaming query, use:
+            # 3) gate on Spark seeing the growth
             from utils.helper_service_ready import wait_for_stream_offset_growth
             q = get_active_stream_query_by_name("lake_stream-generic-ingestor")  # small helper you add
             if q:
@@ -774,29 +762,6 @@ def main():
                 log.info("[STREAM][status] isActive=%s", q.isActive)
                 lp = q.lastProgress or {}
                 log.info("[STREAM][source-desc] %s", (lp.get("sources", [{}])[0].get("description")))
-
-            # produced_once = set()
-            # if tables_needing_initial_load:
-            #     todo = sorted(list(tables_needing_initial_load))
-            #     log.info("[INITIAL LOAD] Producing full load for tables: %s", todo)
-            #     produced_map = produce_tables_once(todo)  # sends historical rows to Kafka; streaming will ingest them
-            #     produced_total = sum(produced_map.values())
-            #     # Gate on Kafka offsets and then on Spark’s view of them
-            #     wait_for_kafka_increase(produced_total, timeout_sec=60)
-            #     if query is not None:
-            #         wait_for_stream_offset_growth(query, produced_total, timeout_sec=60)
-            #     produced_once |= set(todo)
-        #
-        # remaining = [t for t in lake_tables if t not in produced_once]
-        # if remaining:
-        #     # In case some lake tables already existed but didn't need DV scaffolding,
-        #     # still produce their initial backlog now that the stream is attached.
-        #     log.info("[INITIAL LOAD] Producing full load for remaining tables: %s", remaining)
-        #     produced_map = produce_tables_once(remaining)
-        #     produced_total = sum(produced_map.values())
-        #     wait_for_kafka_increase(produced_total, timeout_sec=60)
-        #     if query is not None:
-        #         wait_for_stream_offset_growth(query, produced_total, timeout_sec=60)
 
         # -------- Phase 4: Continuous CDC producer (insert-only) --------
         cdc_thread = threading.Thread(
@@ -806,7 +771,7 @@ def main():
         )
         cdc_thread.start()
 
-        # -------- Phase 5: Lifecyle / graceful shutdown --------
+        # -------- Phase 5: Lifecycle / graceful shutdown --------
         try:
             if query is not None:
                 query.awaitTermination()

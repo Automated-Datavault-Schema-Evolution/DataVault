@@ -184,9 +184,7 @@ def wait_for_kafka_total_at_least(
         time.sleep(1.0)
     raise TimeoutError(f"[SERVICE_NOT_READY][KAFKA_OFFSETS] '{topic}' did not reach total {min_total} within {timeout_sec}s")
 
-# Backward compatible wrapper: if caller *doesn't* pass a base, we snapshot it here.
-# Recommended usage: pass base_total measured *before* produce. Otherwise we still work,
-# but will be sensitive to concurrent producers.
+
 def wait_for_kafka_increase(
     min_delta: int,
     timeout_sec: int = 60,
@@ -203,44 +201,3 @@ def wait_for_kafka_increase(
     target = base_total + max(min_delta, 0)
     wait_for_kafka_total_at_least(target, timeout_sec, bootstrap, topic)
     return target
-
-# def wait_for_kafka_increase(
-#     min_delta: int,
-#     timeout_sec: int = 60,
-#     bootstrap: str | None = None,
-#     topic: str | None = None,
-# ) -> int:
-#     """
-#     Wait until Kafka end offsets for `topic` increase by >= min_delta.
-#     Returns the observed increase; raises TimeoutError on timeout.
-#     """
-#     bootstrap = bootstrap or KAFKA_BOOTSTRAP_SERVERS
-#     topic = topic or KAFKA_TOPIC
-#
-#     start_offsets = _topic_end_offsets(bootstrap, topic)
-#     base_total = sum(start_offsets.values())
-#
-#     log.info(f"[ASSERT][KAFKA_OFFSETS][BASE] bootstrap={bootstrap} topic={topic} base_total={base_total} per_partition={start_offsets}")
-#
-#     start = time.time()
-#     last_total = base_total
-#
-#     while time.time() - start < timeout_sec:
-#         end_offsets = _topic_end_offsets(bootstrap, topic)
-#         total = sum(end_offsets.values())
-#         log.debug(f"[ASSERT][KAFKA_OFFSETS][TICK] total={total} Δ={total - base_total} per_partition={end_offsets}")
-#
-#         if total - base_total >= min_delta:
-#             log.info(
-#                 "[SERVICE_READY][KAFKA_OFFSETS] Topic '%s' end-offsets grew by %s (total=%s)",
-#                 topic, total - base_total, total
-#             )
-#             return total - base_total
-#         last_total = total
-#         time.sleep(1.0)
-#
-#     raise TimeoutError(
-#         f"[SERVICE_NOT_READY][KAFKA_OFFSETS] Topic '{topic}' did not grow by {min_delta} "
-#         f"within {timeout_sec}s (Δ={last_total - base_total}, base={base_total}, last_total={last_total})."
-#     )
-

@@ -148,7 +148,6 @@ def get_spark_session(app_name="Kafka_Consumer_Lake_Handler"):
             ])
         )
     spark = builder.getOrCreate()
-    # spark.sparkContext.setLogLevel("INFO")
     log.debug(f"Spark configuration: {spark.sparkContext.getConf().getAll()}")
     return spark
 
@@ -175,7 +174,6 @@ def get_active_stream_query_by_name(name: str, spark=None, wait_for: float = 0.0
     if spark is None:
         spark = SparkSession.getActiveSession()
         if spark is None:
-            # Prefer your helper if available; fall back to getOrCreate
             try:
                 spark = get_spark_session("DataVault_Bootstrap")
             except NameError:

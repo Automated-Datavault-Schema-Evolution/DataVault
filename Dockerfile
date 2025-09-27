@@ -3,7 +3,6 @@
 # ============================
 FROM python:3.12-slim-bullseye
 
-# Match Spark 3.5.x default JDK; keep tools you used
 RUN apt-get update && apt-get install -y --no-install-recommends \
       gcc \
       libglib2.0-0 \
@@ -25,7 +24,6 @@ ARG APP_GID=1001
 ARG APP_USER=appuser
 ARG APP_GROUP=appgroup
 
-# Create group + user once (no duplicate 185:185 user)
 RUN groupadd -g ${APP_GID} ${APP_GROUP} || true && \
     useradd -m -u ${APP_UID} -g ${APP_GID} -d /home/${APP_USER} -s /bin/bash ${APP_USER}
 
@@ -58,7 +56,6 @@ COPY .env.docker /app/.env.docker
 # Keep Ivy happy and mirror env knobs
 ENV ENV_TYPE=docker \
     SPARK_IVY_PATH=/tmp/.ivy2
-# (HOME can stay as the user's home; Spark sets -Duser.home=/tmp in code)
 
 # Make sure runtime user owns the app dir too
 RUN chown -R ${APP_UID}:${APP_GID} /app
@@ -66,5 +63,4 @@ RUN chown -R ${APP_UID}:${APP_GID} /app
 # Drop privileges
 USER ${APP_UID}:${APP_GID}
 
-# Default command
 CMD ["python", "main.py"]

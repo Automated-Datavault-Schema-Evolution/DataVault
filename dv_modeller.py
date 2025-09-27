@@ -1,7 +1,6 @@
 import re
 from logger import log
 
-# Added 'code' to suffixes
 KEY_SUFFIXES = ["id", "nr", "key", "number", "code"]
 TECH_COLS = {"modified_at", "__ingested_at", "__record_source"}
 

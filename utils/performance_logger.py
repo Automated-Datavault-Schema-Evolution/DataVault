@@ -20,7 +20,7 @@ class PerfListener(StreamingQueryListener):
         log.info(f"[STREAM] started id={event.id} runId={event.runId} name={event.name}")
 
     def onQueryProgress(self, event):
-        p = event.progress  # StreamingQueryProgress
+        p = event.progress
         try:
             irps = float(p.inputRowsPerSecond)
         except Exception:
@@ -39,8 +39,6 @@ class PerfListener(StreamingQueryListener):
             "[STREAM][perf] name=%s batchId=%s numIn=%s irps=%.2f prps=%.2f trigMs=%s addMs=%s stateOps=%s",
             p.name, p.batchId, p.numInputRows, irps, prps, trig_ms, add_ms, len(getattr(p, "stateOperators", []) or []),
         )
-
-        # If you want a JSON line for external aggregation:
         log.debug("[STREAM][progress-json] %s", p.json)  # one JSON per batch
 
     def onQueryTerminated(self, event):

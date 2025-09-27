@@ -89,7 +89,7 @@ def ensure_bronze_table_exists(spark: SparkSession, table_name: str, schema: T.S
         fmt, loc = "unknown", ""
 
     if fmt == "delta":
-        return False  # already correct
+        return False
 
     log.warning("[BRONZE] Existing table %s is %s; attempting to convert/register", fq, fmt)
 
@@ -101,7 +101,7 @@ def ensure_bronze_table_exists(spark: SparkSession, table_name: str, schema: T.S
     except Exception as e:
         log.warning("[BRONZE] In-place CONVERT TO DELTA failed for %s: %s", fq, e)
 
-    # Fallback via path: prefer the table's own location; otherwise our external dir
+    # Fallback via path: prefer the table's own location; otherwise external dir
     target_path = Path(loc) if loc else table_dir
 
     if _is_delta_dir(target_path):
@@ -117,7 +117,7 @@ def ensure_bronze_table_exists(spark: SparkSession, table_name: str, schema: T.S
         log.info("[BRONZE] Converted Parquet at %s to Delta and re-registered %s", target_path, fq)
         return True
 
-    # Last resort: clean registration to our external dir when empty/non-existent
+    # Last resort: clean registration to external dir when empty/non-existent
     if (not target_path.exists()) or (target_path.exists() and not any(target_path.iterdir())):
         spark.sql(f"DROP TABLE IF EXISTS {fq}")
         target_path.mkdir(parents=True, exist_ok=True)
@@ -129,7 +129,6 @@ def ensure_bronze_table_exists(spark: SparkSession, table_name: str, schema: T.S
         log.info("[BRONZE] Recreated %s as external Delta at %s", fq, target_path)
         return True
 
-    # Non-empty, not Delta/Parquet → avoid data loss; let a human decide
     raise RuntimeError(
         f"[BRONZE] Path {target_path} for {fq} is non-empty and not a Delta/Parquet layout. "
         f"Please clean or move it, then re-run."
@@ -162,7 +161,6 @@ def start_bronze_writer(
     query_name=None,
     trigger_every=None,
 ):
-    from pyspark.sql import functions as F
     from pyspark import StorageLevel
     from pyspark.sql import DataFrame
 
@@ -263,7 +261,7 @@ def start_bronze_writer(
         return w.start()
 
     # Multi-table mode
-    from pyspark.sql import functions as F  # ensure available in this scope
+    from pyspark.sql import functions as F
 
     if table_col not in df_stream.columns:
         raise ValueError(f"Streaming DF is missing '{table_col}' column for multi-table writes.")

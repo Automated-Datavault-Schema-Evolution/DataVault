@@ -118,7 +118,6 @@ def load_rdbms_table(table_name):
         dbname=RDBMS_DB, user=RDBMS_USER, password=RDBMS_PASSWORD
     )
     cur = conn.cursor()
-    # Use psycopg2.sql.Identifier for schema and table names (no static SQL)
     query = sql.SQL("SELECT * FROM {}.{}").format(
         sql.Identifier(RDBMS_SCHEMA),
         sql.Identifier(table_name)
