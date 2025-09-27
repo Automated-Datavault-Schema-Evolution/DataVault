@@ -169,11 +169,21 @@ def _append_db(data, table):
             cur.execute(
                 sql.SQL(
                     """
-                    CREATE TABLE IF NOT EXISTS {}.{} (
-                        id SERIAL PRIMARY KEY,
-                        payload JSONB,
-                        inserted_at TIMESTAMPTZ DEFAULT NOW()
+                    CREATE TABLE IF NOT EXISTS {}.{}
+                    (
+                        id
+                        SERIAL
+                        PRIMARY
+                        KEY,
+                        payload
+                        JSONB,
+                        inserted_at
+                        TIMESTAMPTZ
+                        DEFAULT
+                        NOW
+                    (
                     )
+                        )
                     """
                 ).format(sql.Identifier(METASTORE_DB_SCHEMA), sql.Identifier(table))
             )

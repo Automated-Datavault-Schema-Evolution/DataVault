@@ -1,13 +1,16 @@
 import json
-from typing import List
 import os
-from pyspark.sql import SparkSession, functions as F
+from typing import List
+
 from logger import log
+from pyspark.sql import SparkSession, functions as F
+
 from config import (
     LAKE_TYPE, PARQUET_PATH,
     RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER, RDBMS_PASSWORD, RDBMS_SCHEMA, STAGING_SCHEMA, KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_TOPIC
 )
+
 
 def introspect_lake_columns(spark: SparkSession, table: str) -> List[str]:
     """

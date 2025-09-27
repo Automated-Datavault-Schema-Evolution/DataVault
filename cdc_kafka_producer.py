@@ -20,7 +20,8 @@ from utils.performance_logger import PerfListener
 from utils.schema_helpers import introspect_lake_columns
 
 WATERMARK_FILE = "/data/state/cdc_watermarks.json"
-WATERMARK_DIR  = os.path.dirname(WATERMARK_FILE)
+WATERMARK_DIR = os.path.dirname(WATERMARK_FILE)
+
 
 def build_initial_load_sql(table: str) -> str:
     # Use only real columns from the lake
@@ -30,8 +31,10 @@ def build_initial_load_sql(table: str) -> str:
     col_list = ", ".join([f'"{c}"' for c in cols])  # quote for safety
     return f'SELECT {col_list} FROM "{RDBMS_SCHEMA}"."{table}"'
 
+
 # --- Kafka topic management ---
-def check_and_create_topic(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS, topic_name=KAFKA_TOPIC, num_partitions=KAFKA_PARTITIONS, replication_factor=KAFKA_REPLICATION, timeout_sec=30):
+def check_and_create_topic(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS, topic_name=KAFKA_TOPIC,
+                           num_partitions=KAFKA_PARTITIONS, replication_factor=KAFKA_REPLICATION, timeout_sec=30):
     """
     Ensures a Kafka topic exists and waits until at least one partition is available.
     """

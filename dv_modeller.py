@@ -1,8 +1,10 @@
 import re
+
 from logger import log
 
 KEY_SUFFIXES = ["id", "nr", "key", "number", "code"]
 TECH_COLS = {"modified_at", "__ingested_at", "__record_source"}
+
 
 def _normalize(name: str) -> str:
     """Normalize a column name for comparison."""

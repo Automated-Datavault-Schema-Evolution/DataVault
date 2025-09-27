@@ -1,14 +1,14 @@
+import json
 import os
 from pathlib import Path
-import json
 
+from logger import log
+from pyspark.errors import AnalysisException
 from pyspark.sql import SparkSession
 from pyspark.sql import types as T
-from pyspark.errors import AnalysisException
 
 from config import STAGING_SCHEMA, STAGING_BASE_PATH  # ← use staging base path
 from utils.schema_helpers import infer_schema_from_cdc_event
-from logger import log
 
 
 def _ensure_db(spark: SparkSession):
@@ -150,16 +150,16 @@ def truncate_bronze_table(spark: SparkSession, table_name: str) -> None:
 
 
 def start_bronze_writer(
-    spark,
-    df_stream,
-    *,
-    table_name=None,
-    table_col="table",
-    checkpoint_base=None,
-    on_after_write=None,
-    allowed_tables=None,
-    query_name=None,
-    trigger_every=None,
+        spark,
+        df_stream,
+        *,
+        table_name=None,
+        table_col="table",
+        checkpoint_base=None,
+        on_after_write=None,
+        allowed_tables=None,
+        query_name=None,
+        trigger_every=None,
 ):
     from pyspark import StorageLevel
     from pyspark.sql import DataFrame
@@ -214,7 +214,8 @@ def start_bronze_writer(
             return 0
 
         parsed = (
-            tdf_raw.select(F.from_json(F.col("payload"), schema).alias("p"), F.col("cdc_type"), F.col("cdc_modified_at"))
+            tdf_raw.select(F.from_json(F.col("payload"), schema).alias("p"), F.col("cdc_type"),
+                           F.col("cdc_modified_at"))
             .select("p.*", "cdc_type", "cdc_modified_at")
             .withColumn("__ingested_at", F.current_timestamp())
             .withColumn("__record_source", F.lit("kafka_cdc"))

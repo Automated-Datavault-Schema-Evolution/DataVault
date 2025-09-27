@@ -1,5 +1,4 @@
 import os
-import sys
 from pathlib import Path
 
 from logger import log
@@ -33,6 +32,7 @@ def _pick_warehouse_dir() -> Path:
     is_local = str(SPARK_MASTER).startswith("local") or os.getenv("ENV_TYPE", "local") == "local"
     base = HOST_SPARK_WAREHOUSE_DIR if is_local else CONTAINER_WAREHOUSE_DIR
     return Path(base).resolve()
+
 
 def ensure_spark_warehouse_dir():
     """Ensure Spark's warehouse dir exists and is writable."""
@@ -108,7 +108,7 @@ def get_spark_session(app_name="Kafka_Consumer_Lake_Handler"):
             .config("spark.dynamicAllocation.initialExecutors", SPARK_DYNAMIC_ALLOCATION_INITIAL_EXECUTORS)
         )
 
-    # --- Ivy + user.home (mirrors the working minimal setup) ---
+    # --- Ivy + user.home
     builder = (
         builder
         .config("spark.jars.ivy", SPARK_IVY_PATH or "/tmp/.ivy2")

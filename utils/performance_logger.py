@@ -1,8 +1,9 @@
 import threading
 import time
 
-from pyspark.sql.streaming import StreamingQueryListener
 from logger import log
+from pyspark.sql.streaming import StreamingQueryListener
+
 
 def log_progress_periodically(q, interval=30):
     def _loop():
@@ -13,7 +14,9 @@ def log_progress_periodically(q, interval=30):
                          p["name"], p["batchId"], p["numInputRows"],
                          p.get("inputRowsPerSecond"), p.get("processedRowsPerSecond"))
             time.sleep(interval)
+
     threading.Thread(target=_loop, name="progress-logger", daemon=True).start()
+
 
 class PerfListener(StreamingQueryListener):
     def onQueryStarted(self, event):
@@ -33,7 +36,7 @@ class PerfListener(StreamingQueryListener):
         # Useful durations (ms) if available
         dur = getattr(p, "durationMs", {}) or {}
         trig_ms = int(dur.get("triggerExecution", 0))
-        add_ms  = int(dur.get("addBatch", 0))
+        add_ms = int(dur.get("addBatch", 0))
 
         log.info(
             "[STREAM][perf] name=%s batchId=%s numIn=%s irps=%.2f prps=%.2f trigMs=%s addMs=%s stateOps=%s",

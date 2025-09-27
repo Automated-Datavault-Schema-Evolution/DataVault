@@ -5,9 +5,9 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
-import time
 
 import pandas as pd
 import yaml
@@ -32,9 +32,9 @@ from utils.schema_helpers import bronze_target_columns, infer_schema_from_cdc_ev
 
 _DBT_LOCK = threading.Lock()  # serialize dbt runs during streaming
 
-
 # ----------- global runtime for graceful shutdown -------------------
-RUN = SimpleNamespace(stop_event= None, query=None, cdc_thread=None)
+RUN = SimpleNamespace(stop_event=None, query=None, cdc_thread=None)
+
 
 def _graceful_shutdown(signum=None, frame=None):
     """Handle SIGTERM/SIGINT and atexit: stop CDC + drain/stop Spark cleanly."""
@@ -53,7 +53,7 @@ def _graceful_shutdown(signum=None, frame=None):
     if q is not None:
         try:
             if q.isActive:
-                q.stop() # drain in-flight micro batches
+                q.stop()  # drain in-flight micro batches
         except Exception as e:
             try:
                 log.warning(f"[SHUTDOWN] query.stop() failed: {e}]")
@@ -75,9 +75,10 @@ def _graceful_shutdown(signum=None, frame=None):
     except Exception:
         pass
 
+
 # register handlers early to catch signals during bootstrap
 signal.signal(signal.SIGTERM, _graceful_shutdown)
-signal.signal(signal.SIGINT,  _graceful_shutdown)
+signal.signal(signal.SIGINT, _graceful_shutdown)
 atexit.register(_graceful_shutdown)
 
 
@@ -266,7 +267,7 @@ def write_sql_model_file(model_name, table_name, model_type, meta):
         raise ValueError(f"Unsupported model_type: {model_type!r}")
 
     business_keys = list(meta.get("business_keys", []))
-    attributes    = list(meta.get("attributes", []))
+    attributes = list(meta.get("attributes", []))
 
     src_name = meta.get("source_name") or "staging"
 
@@ -321,8 +322,6 @@ def write_sql_model_file(model_name, table_name, model_type, meta):
     return wrote
 
 
-
-
 def write_json_model_file(model_name, table_name, model_type, meta):
     """Persist model metadata as JSON for dbt-spark (idempotent) and sync SQL."""
     os.makedirs(DBT_MODELS_JSON_DIR, exist_ok=True)
@@ -346,7 +345,7 @@ def write_json_model_file(model_name, table_name, model_type, meta):
 
     json_txt = json.dumps(model_def, indent=2) + "\n"
     wrote_json = write_text_if_changed(file_path, json_txt)
-    wrote_sql  = write_sql_model_file(model_name, table_name, mtype, model_def)
+    wrote_sql = write_sql_model_file(model_name, table_name, mtype, model_def)
     if wrote_json or wrote_sql:
         write_metadata(model_def)
         write_lineage(
@@ -468,6 +467,7 @@ def ensure_profiles_dir():
             f.write("# Insert your dbt profile config here\n")
         log.info(f"[INFO] Created empty profiles.yml at: {profiles_yml_path}")
 
+
 def ensure_real_profiles():
     """
     Force DBT_PROFILES_DIR to the repo's profiles/ folder.
@@ -479,6 +479,7 @@ def ensure_real_profiles():
         raise RuntimeError(f"profiles/ directory not found at {repo_profiles}")
     os.environ["DBT_PROFILES_DIR"] = str(repo_profiles)
     return repo_profiles
+
 
 # Spark consumer (Streaming + model generation)
 def get_kafka_stream(spark, table_name, schema):
@@ -542,7 +543,6 @@ def streaming_dv_consumer_and_dbt(models_to_run):
 
     checkpoint_root = os.environ.get("CHECKPOINT_PATH", "/data/checkpoints")
     checkpoint_dir = os.path.join(checkpoint_root, f"{KAFKA_TOPIC}_generic_v3")
-
 
     ## TODO: ONLY FOR TESTING, REMOVE BEFORE DEPLOYMENT
     if os.environ.get("STREAM_CHECKPOINT_RESET", "").lower() in {"1", "true", "yes"}:
@@ -762,9 +762,11 @@ def main():
         stop_event = threading.Event()
         RUN.stop_event = stop_event
         query = None
+        query_holder = {"q": None}
         if processing_mode == "streaming":
             # Start stream and keep handle (non-blocking; returns StreamingQuery)
             query = streaming_dv_consumer_and_dbt(models_to_run)
+            query_holder["q"] = query
             RUN.query = query
             # Small settle time so Spark attaches before initial production
             try:
@@ -824,9 +826,9 @@ def main():
 
             # 3) gate on Spark seeing the growth
             from utils.helper_service_ready import wait_for_stream_offset_growth
-            q = get_active_stream_query_by_name("lake_stream-generic-ingestor") or query # small helper you add
+            q = get_active_stream_query_by_name("lake_stream-generic-ingestor") or query  # small helper you add
             if q:
-                wait_for_stream_offset_growth(q, produced_total=produced_total,base_total=base_total, timeout_sec=60)
+                wait_for_stream_offset_growth(q, produced_total=produced_total, base_total=base_total, timeout_sec=60)
                 log.info("[STREAM][status] isActive=%s", q.isActive)
                 lp = q.lastProgress or {}
                 log.info("[STREAM][source-desc] %s", (lp.get("sources", [{}])[0].get("description")))
@@ -841,13 +843,6 @@ def main():
         cdc_thread = threading.Thread(target=_cdc_loop, daemon=False, name="cdc-insert-only")
         RUN.cdc_thread = cdc_thread
         cdc_thread.start()
-
-        # cdc_thread = threading.Thread(
-        #     target=cdc_producer_insert_only,
-        #     daemon=True,
-        #     name="cdc-insert-only",
-        # )
-        # cdc_thread.start()
 
         # -------- Phase 5: Lifecycle / graceful shutdown --------
         try:

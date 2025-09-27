@@ -1,10 +1,10 @@
-import time
 import os
+import time
+from typing import Optional, Dict
 
-import psycopg2
 from kafka import KafkaConsumer, TopicPartition
 from logger import log
-from typing import Optional, Dict
+
 from config import LAKE_TYPE, PARQUET_PATH, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER, RDBMS_PASSWORD, \
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC
 
@@ -20,14 +20,13 @@ def wait_for_kafka(bootstrap, topic, timeout_sec: int = 60):
             partitions = producer.partitions_for(topic)
             producer.close()
 
-            if partitions and len(partitions)>0:
+            if partitions and len(partitions) > 0:
                 log.info(f"[SERVICE_READY][KAFKA] Kafka topic '{topic}' has {len(partitions)} partition(s)")
                 return
         except Exception as e:
             last_error = e
         time.sleep(1.0)
     raise TimeoutError(f"Kafka not ready for topic '{topic}': {last_error}")
-
 
 
 def wait_for_lake(timeout_sec: int = 60):
@@ -72,7 +71,8 @@ def wait_for_lake(timeout_sec: int = 60):
             except Exception as e:
                 last_error = e
                 time.sleep(1.0)
-        raise TimeoutError(f"[SERVICE_NOT_READY][DATA_LAKE] RDBMS lake not ready (host={RDBMS_HOST}, db={RDBMS_DB}): {last_error}")
+        raise TimeoutError(
+            f"[SERVICE_NOT_READY][DATA_LAKE] RDBMS lake not ready (host={RDBMS_HOST}, db={RDBMS_DB}): {last_error}")
     else:
         log.error(f"[SERVICE_NOT_READY][DATA_LAKE] Unknown LAKE_TYPE='{LAKE_TYPE}', continuing without wait")
 
@@ -87,13 +87,14 @@ def _sum_latest_offsets_from_progress(progress_json: dict) -> int:
     except Exception:
         return 0
 
+
 def wait_for_stream_offset_growth(
-    query,
-    produced_total: int,
-    base_total: int | None = None,
-    timeout_sec: int = 60,
-    poll_interval: float = 1.0,
-    nudge: bool = True,
+        query,
+        produced_total: int,
+        base_total: int | None = None,
+        timeout_sec: int = 60,
+        poll_interval: float = 1.0,
+        nudge: bool = True,
 ) -> int:
     """
     Wait until the streaming query sees Kafka latest offsets reach:
@@ -156,7 +157,6 @@ def wait_for_stream_offset_growth(
     )
 
 
-
 def _topic_end_offsets(bootstrap: str, topic: str) -> Dict[int, int]:
     """
     Return end offsets per partition for `topic`.
@@ -177,17 +177,19 @@ def _topic_end_offsets(bootstrap: str, topic: str) -> Dict[int, int]:
     c.close()
     return {tp.partition: int(ends_map.get(tp, 0)) for tp in tps}
 
+
 def kafka_total_end(bootstrap: Optional[str] = None, topic: Optional[str] = None) -> int:
     """Total end-offset across all partitions, now."""
     bootstrap = bootstrap or KAFKA_BOOTSTRAP_SERVERS
     topic = topic or KAFKA_TOPIC
     return sum(_topic_end_offsets(bootstrap, topic).values())
 
+
 def wait_for_kafka_total_at_least(
-    min_total: int,
-    timeout_sec: int = 60,
-    bootstrap: Optional[str] = None,
-    topic: Optional[str] = None,
+        min_total: int,
+        timeout_sec: int = 60,
+        bootstrap: Optional[str] = None,
+        topic: Optional[str] = None,
 ) -> int:
     """
     Wait until Kafka total end-offset is >= min_total. Returns the observed total.
@@ -204,15 +206,16 @@ def wait_for_kafka_total_at_least(
             log.info("[SERVICE_READY][KAFKA_OFFSETS] '%s' reached total=%s (target=%s)", topic, total, min_total)
             return total
         time.sleep(1.0)
-    raise TimeoutError(f"[SERVICE_NOT_READY][KAFKA_OFFSETS] '{topic}' did not reach total {min_total} within {timeout_sec}s")
+    raise TimeoutError(
+        f"[SERVICE_NOT_READY][KAFKA_OFFSETS] '{topic}' did not reach total {min_total} within {timeout_sec}s")
 
 
 def wait_for_kafka_increase(
-    min_delta: int,
-    timeout_sec: int = 60,
-    bootstrap: Optional[str] = None,
-    topic: Optional[str] = None,
-    base_total: Optional[int] = None,
+        min_delta: int,
+        timeout_sec: int = 60,
+        bootstrap: Optional[str] = None,
+        topic: Optional[str] = None,
+        base_total: Optional[int] = None,
 ) -> int:
     bootstrap = bootstrap or KAFKA_BOOTSTRAP_SERVERS
     topic = topic or KAFKA_TOPIC
