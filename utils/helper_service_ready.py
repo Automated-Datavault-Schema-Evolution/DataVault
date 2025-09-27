@@ -87,50 +87,72 @@ def _sum_latest_offsets_from_progress(progress_json: dict) -> int:
     except Exception:
         return 0
 
-def wait_for_stream_offset_growth(query, min_delta: int, timeout_sec: int = 60, nudge: bool = True):
+def wait_for_stream_offset_growth(
+    query,
+    produced_total: int,
+    base_total: int | None = None,
+    timeout_sec: int = 60,
+    poll_interval: float = 1.0,
+    nudge: bool = True,
+) -> int:
     """
-    Wait until the streaming query's Kafka `latestOffset` increases by >= min_delta.
-    We 'nudge' the query with processAllAvailable() so a new trigger runs and progress updates.
+    Wait until the streaming query sees Kafka latest offsets reach:
+        target_total = (base_total or 0) + produced_total
+
+    This uses the query's lastProgress["sources"][0]["latestOffset"] counters,
+    i.e. an absolute total across partitions, not a delta since the call began.
+
+    Examples:
+      - If you measured Kafka baseline at 0 and produced 500, we wait for >= 500.
+      - If baseline was 123 and kafka produced 500, we wait for >= 623.
+
+    Returns the final observed total on success. Raises TimeoutError on expiry.
     """
-    import time
-    start = time.time()
-    base = None
-    last_total = 0
+    if produced_total <= 0:
+        log.info("[STREAM_OFFSETS] No increase requested (produced_total<=0); nothing to wait for.")
+        return 0
 
-    def _latest_total(q):
-        p = q.lastProgress or {}
-        return _sum_latest_offsets_from_progress(p) if p else 0
+    # Helper to sum the total from the query's latest progress snapshot
+    def _latest_total(_q) -> int:
+        p = getattr(_q, "lastProgress", None) or {}
+        return _sum_latest_offsets_from_progress(p) or 0
 
-    # one initial nudge after producing
-    if nudge:
-        try:
-            query.processAllAvailable()
-        except Exception:
-            pass
+    target_total = (base_total or 0) + int(produced_total)
+    end_ts = time.time() + timeout_sec
 
-    while time.time() - start < timeout_sec:
-        total = _latest_total(query)
-        if base is None:
-            base = total
+    # First snapshot
+    last_total = _latest_total(query)
 
-        if (total - base) >= max(0, min_delta):
-            log.info("[SERVICE_READY][STREAM_OFFSETS] Spark sees Kafka latestOffset grew by %s (base=%s total=%s)",
-                     total - base, base, total)
-            return
+    # Fast-path: already at/over target
+    if last_total >= target_total:
+        log.info(
+            f"[SERVICE_READY][STREAM_OFFSETS] already observed total={last_total} >= target={target_total}; ready"
+        )
+        return last_total
 
-        # periodic nudge so progress gets refreshed
+    # Main wait loop
+    while time.time() < end_ts:
         if nudge:
+            # Try to help the query make progress quickly
             try:
                 query.processAllAvailable()
             except Exception:
                 pass
 
-        time.sleep(1.0)
-        last_total = total
+        time.sleep(poll_interval)
+        last_total = _latest_total(query)
+        log.debug(
+            f"[ASSERT][STREAM_OFFSETS][TICK] base={base_total or 0} produced={produced_total} target={target_total} last_total={last_total}")
+        if last_total >= target_total:
+            log.info(
+                f"[SERVICE_READY][STREAM_OFFSETS] Observed total={last_total} >= target={target_total}")
+            return last_total
 
+    # Timed out
     raise TimeoutError(
-        f"[SERVICE_NOT_READY][STREAM_OFFSETS]Streaming query did not observe Kafka offset growth of "
-        f"{min_delta} within {timeout_sec}s (Δdelta={(last_total - (base or 0))}, base={base}, last_total={last_total})."
+        f"[SERVICE_NOT_READY][STREAM_OFFSETS]"
+        f" Streaming query did not reach total>={target_total} within {timeout_sec}s "
+        f"(base={base_total or 0}, produced={produced_total}, last_total={last_total})."
     )
 
 

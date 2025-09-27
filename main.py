@@ -758,7 +758,7 @@ def main():
             from utils.helper_service_ready import wait_for_stream_offset_growth
             q = get_active_stream_query_by_name("lake_stream-generic-ingestor")  # small helper you add
             if q:
-                wait_for_stream_offset_growth(q, produced_total, timeout_sec=60)
+                wait_for_stream_offset_growth(q, produced_total=produced_total,base_total=base_total, timeout_sec=60)
                 log.info("[STREAM][status] isActive=%s", q.isActive)
                 lp = q.lastProgress or {}
                 log.info("[STREAM][source-desc] %s", (lp.get("sources", [{}])[0].get("description")))
