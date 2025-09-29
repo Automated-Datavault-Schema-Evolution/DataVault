@@ -215,27 +215,27 @@ def produce_tables_once(tables):
             produced_counts[table] = 0
             continue
 
-        if "modified_at" not in df.columns:
-            log.warning(f"Table {table} skipped: no 'modified_at' column for CDC.")
+        if "ingestion_timestamp" not in df.columns:
+            log.warning(f"Table {table} skipped: no 'ingestion_timestamp' column for CDC.")
             produced_counts[table] = 0
             continue
 
-        df = df.dropna(subset=["modified_at"])
+        df = df.dropna(subset=["ingestion_timestamp"])
         cnt = 0
         futures = []
 
         # publish
         for _, row in df.iterrows():
             payload = row.dropna().to_dict()
-            modified_at = payload.get("modified_at")
+            ingestion_timestamp = payload.get("ingestion_timestamp")
 
             # normalize to ISO string
-            if isinstance(modified_at, pd.Timestamp):
-                if modified_at.tzinfo is None:
-                    modified_at = modified_at.tz_localize("UTC")
-                modified_at = modified_at.isoformat()
+            if isinstance(ingestion_timestamp, pd.Timestamp):
+                if ingestion_timestamp.tzinfo is None:
+                    ingestion_timestamp = ingestion_timestamp.tz_localize("UTC")
+                ingestion_timestamp = ingestion_timestamp.isoformat()
 
-            payload["modified_at"] = modified_at
+            payload["ingestion_timestamp"] = ingestion_timestamp
 
             futures.append(producer.send(
                 KAFKA_TOPIC,
@@ -243,7 +243,7 @@ def produce_tables_once(tables):
                     "table": table,
                     "payload": json.dumps(payload, default=str),
                     "cdc_type": "insert",
-                    "cdc_modified_at": modified_at,
+                    "cdc_ingestion_timestamp": ingestion_timestamp,
                 },
             ))
             cnt += 1
@@ -253,8 +253,8 @@ def produce_tables_once(tables):
             fut.get(timeout=30)
 
         if cnt > 0:
-            # df['modified_at'] may be mixed types; let pandas compute max then normalize
-            max_ts = pd.to_datetime(df["modified_at"], errors="coerce", utc=True).max()
+            # df['ingestion_timestamp'] may be mixed types; let pandas compute max then normalize
+            max_ts = pd.to_datetime(df["ingestion_timestamp"], errors="coerce", utc=True).max()
             watermarks[table] = max_ts
             log.info(f"[CDC Producer] Produced {cnt} events for {table}. Watermark: {watermarks.get(table)}")
         else:
@@ -301,13 +301,13 @@ def cdc_producer_insert_only(stop_event=None):
                 log.info(f"Error loading {table}: {e}")
                 continue
 
-            if "modified_at" not in df.columns:
-                log.warning(f"Table {table} skipped: no 'modified_at' column for CDC.")
+            if "ingestion_timestamp" not in df.columns:
+                log.warning(f"Table {table} skipped: no 'ingestion_timestamp' column for CDC.")
                 continue
 
             last_ts = watermarks.get(table)
             if last_ts is not None and not pd.isna(last_ts):
-                df_ts = pd.to_datetime(df["modified_at"], errors="coerce", utc=True)
+                df_ts = pd.to_datetime(df["ingestion_timestamp"], errors="coerce", utc=True)
                 new_rows = df[df_ts > last_ts]
             else:
                 new_rows = df
@@ -315,15 +315,15 @@ def cdc_producer_insert_only(stop_event=None):
             if new_rows.empty:
                 continue
 
-            new_rows = new_rows.dropna(subset=["modified_at"])
+            new_rows = new_rows.dropna(subset=["ingestion_timestamp"])
             for _, row in new_rows.iterrows():
                 payload = row.dropna().to_dict()
-                modified_at = payload.get("modified_at")
-                if isinstance(modified_at, pd.Timestamp):
-                    if modified_at.tzinfo is None:
-                        modified_at = modified_at.tz_localize("UTC")
-                    modified_at = modified_at.isoformat()
-                payload["modified_at"] = modified_at
+                ingestion_timestamp = payload.get("ingestion_timestamp")
+                if isinstance(ingestion_timestamp, pd.Timestamp):
+                    if ingestion_timestamp.tzinfo is None:
+                        ingestion_timestamp = ingestion_timestamp.tz_localize("UTC")
+                    ingestion_timestamp = ingestion_timestamp.isoformat()
+                payload["ingestion_timestamp"] = ingestion_timestamp
 
                 producer.send(
                     KAFKA_TOPIC,
@@ -331,11 +331,11 @@ def cdc_producer_insert_only(stop_event=None):
                         "table": table,
                         "payload": json.dumps(payload, default=str),
                         "cdc_type": "insert",
-                        "cdc_modified_at": modified_at
+                        "cdc_ingestion_timestamp": ingestion_timestamp
                     }
                 )
 
-            max_ts = pd.to_datetime(new_rows["modified_at"], errors="coerce", utc=True).max()
+            max_ts = pd.to_datetime(new_rows["ingestion_timestamp"], errors="coerce", utc=True).max()
             watermarks[table] = max_ts
             log.info(f"[CDC Producer] Produced {len(new_rows)} events for {table}. Watermark: {max_ts}")
 
