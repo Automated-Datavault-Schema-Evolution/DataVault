@@ -40,8 +40,6 @@ services:
         condition: service_healthy
       datavault-ingestion-spark-thrift:
         condition: service_healthy
-      kafka-jars-init:
-        condition: service_completed_successfully
       warehouse-init:
         condition: service_completed_successfully
 
@@ -57,8 +55,6 @@ services:
       hive-metastore:
         condition: service_healthy
       warehouse-init:
-        condition: service_completed_successfully
-      kafka-jars-init:
         condition: service_completed_successfully
     environment:
       - SPARK_MASTER_PORT=7078
@@ -109,8 +105,6 @@ services:
       datavault-ingestion-spark-master:
         condition: service_healthy
       hive-jars-init:
-        condition: service_completed_successfully
-      kafka-jars-init:
         condition: service_completed_successfully
       warehouse-init:
         condition: service_completed_successfully
@@ -164,8 +158,6 @@ services:
         condition: service_healthy
       hive-jars-init:
         condition: service_completed_successfully
-      kafka-jars-init:
-        condition: service_completed_successfully
       warehouse-init:
         condition: service_completed_successfully
     environment:
@@ -217,8 +209,6 @@ services:
       datavault-ingestion-spark-master:
         condition: service_healthy
       hive-jars-init:
-        condition: service_completed_successfully
-      kafka-jars-init:
         condition: service_completed_successfully
       warehouse-init:
         condition: service_completed_successfully
@@ -333,10 +323,6 @@ services:
         condition: service_completed_successfully
       hive-metastore:
         condition: service_healthy
-      delta-jars-init:
-        condition: service_completed_successfully
-      kafka-jars-init:
-        condition: service_completed_successfully
       warehouse-init:
         condition: service_completed_successfully
     environment:
@@ -437,80 +423,6 @@ services:
     networks:
       - data-automation-net
 
-  jdbc-driver-init:
-    image: curlimages/curl:8.10.1
-    user: "0:0"
-    entrypoint:
-      - sh
-      - -lc
-      - >
-        set -Eeuo pipefail; mkdir -p /out;
-        curl -fL --retry 5 --retry-all-errors
-        -o /out/postgresql-42.7.4.jar
-        https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar;
-        ls -l /out
-    depends_on:
-      warehouse-init:
-        condition: service_completed_successfully
-    volumes:
-      - jdbc-driver:/out
-    networks:
-      - data-automation-net
-
-  delta-jars-init:
-    image: curlimages/curl:8.10.1
-    user: "0:0"
-    entrypoint:
-      - sh
-      - -lc
-      - |
-        set -Eeuo pipefail
-        mkdir -p /out
-        echo "Downloading Delta jars to /out ..."
-        curl -fL --retry 5 --retry-all-errors \
-          -o /out/delta-spark_2.12-3.3.0.jar \
-          https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.3.0/delta-spark_2.12-3.3.0.jar
-        curl -fL --retry 5 --retry-all-errors \
-          -o /out/delta-storage-3.3.0.jar \
-          https://repo1.maven.org/maven2/io/delta/delta-storage/3.3.0/delta-storage-3.3.0.jar
-        ls -l /out
-        # stay up for debugging; remove 'sleep' if you don't need it
-        # sleep infinity
-    volumes:
-      - delta-jars:/out
-    networks: [ data-automation-net ]
-
-  kafka-jars-init:
-    image: curlimages/curl:8.10.1
-    user: "0:0"
-    entrypoint:
-      - sh
-      - -lc
-      - |
-        set -Eeuo pipefail
-        mkdir -p /out
-        echo "Downloading Kafka connector jars to /out ..."
-        curl -fL --retry 5 --retry-all-errors \
-          -o /out/spark-sql-kafka-0-10_2.12-3.5.6.jar \
-          https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.6/spark-sql-kafka-0-10_2.12-3.5.6.jar
-        curl -fL --retry 5 --retry-all-errors \
-          -o /out/spark-token-provider-kafka-0-10_2.12-3.5.6.jar \
-          https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.5.6/spark-token-provider-kafka-0-10_2.12-3.5.6.jar
-        curl -fL --retry 5 --retry-all-errors \
-          -o /out/kafka-clients-3.5.1.jar \
-          https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.5.1/kafka-clients-3.5.1.jar
-        curl -fL --retry 5 --retry-all-errors \
-          -o /out/commons-pool2-2.12.1.jar \
-          https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.12.1/commons-pool2-2.12.1.jar
-        ls -l /out
-        # sleep infinity   # uncomment if you want container to stay alive for debugging
-    volumes:
-      - ext-jars:/out
-    depends_on:
-      warehouse-init:
-        condition: service_completed_successfully
-    networks: [ data-automation-net ]
-
   metastore-db-init:
     user: "0:0"
     image: postgres:latest
@@ -560,8 +472,6 @@ services:
           -userName "${METASTORE_DB_USER}" -passWord "${METASTORE_DB_PASSWORD}" \
           -url "jdbc:postgresql://postgres:5432/${METASTORE_DB}?currentSchema=public" --verbose
     depends_on:
-      jdbc-driver-init:
-        condition: service_completed_successfully
       metastore-db-init:
         condition: service_completed_successfully
       warehouse-init:
@@ -639,10 +549,13 @@ services:
 
 volumes:
   hive-313-jars: {}
-  ext-jars: {}
-  jdbc-driver: {}
+  ext-jars:
+    external: true
+  jdbc-driver:
+    external: true
   spark-ivy-cache: {}
-  delta-jars: {}
+  delta-jars:
+    external: true
   bronze-data:
   spark-checkpoints:
 
