@@ -47,7 +47,8 @@ services:
 
 
   datavault-ingestion-spark-master:
-    user: "1001:1001"
+    # user: "1001:1001"
+    user: "0:0"
     image: apache/spark:3.5.6
     container_name: datavault-ingestion-spark-master
     depends_on:
@@ -61,11 +62,14 @@ services:
         condition: service_completed_successfully
     environment:
       - SPARK_MASTER_PORT=7078
-      - SPARK_MASTER_WEBUI_PORT=8081
+      - SPARK_MASTER_WEBUI_PORT=8090
       - KAFKA_BOOTSTRAP_SERVER=kafka:9092
       - SPARK_CLASSPATH=/opt/delta-jars/*:/opt/ext-jars/*
       - UMASK=0002
       - SPARK_MASTER_OPTS=-Dspark.hadoop.fs.permissions.umask-mode=002
+      - SPARK_NO_DAEMONIZE=1
+      - SPARK_LOG_DIR=/tmp/spark/logs
+      - SPARK_PID_DIR=/tmp/spark/pids
     command:
       - /bin/bash
       - -lc
@@ -74,7 +78,7 @@ services:
         /opt/spark/sbin/start-master.sh
         -h datavault-ingestion-spark-master
         -p "${SPARK_MASTER_PORT:-7078}"
-        --webui-port "${SPARK_MASTER_WEBUI_PORT:-8081}";
+        --webui-port "${SPARK_MASTER_WEBUI_PORT:-8090}";
         tail -F /opt/spark/logs/* &
         wait -n
     volumes:
@@ -86,19 +90,19 @@ services:
       - ext-jars:/opt/ext-jars:ro
     ports:
       - "7078:7078"
-      - "8081:8081"
-      - "4040:4040"
+      - "8090:8090"
     networks: [ data-automation-net ]
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD-SHELL", "curl -fsS http://localhost:8081/ > /dev/null || exit 1" ]
+      test: [ "CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/8090 && exec 3>&- 3<&- || exit 1'" ]
       interval: 5s
       timeout: 5s
       retries: 20
       start_period: 5s
 
   datavault-ingestion-spark-worker-1:
-    user: "1001:1001"
+    # user: "1001:1001"
+    user: "0:0"
     image: apache/spark:3.5.6
     container_name: datavault-ingestion-spark-worker-1
     depends_on:
@@ -113,11 +117,14 @@ services:
     environment:
       - SPARK_WORKER_MEMORY=${SPARK_EXECUTOR_MEMORY}
       - SPARK_WORKER_CORES=${SPARK_EXECUTOR_CORES}
-      - SPARK_WORKER_WEBUI_PORT=8084
+      - SPARK_WORKER_WEBUI_PORT=8091
       - KAFKA_BOOTSTRAP_SERVER=kafka:9092
       - SPARK_CLASSPATH=/opt/delta-jars/*:/opt/ext-jars/*
       - UMASK=0002
       - SPARK_WORKER_OPTS=-Dspark.hadoop.fs.permissions.umask-mode=002
+      - SPARK_NO_DAEMONIZE=1
+      - SPARK_LOG_DIR=/tmp/spark/logs
+      - SPARK_PID_DIR=/tmp/spark/pids
     # platform: linux/amd64
     command:
       - /bin/bash
@@ -125,7 +132,7 @@ services:
       - >
         set -Eeuo pipefail;
         /opt/spark/sbin/start-worker.sh
-        --webui-port "${SPARK_WORKER_WEBUI_PORT:-8081}"
+        --webui-port "${SPARK_WORKER_WEBUI_PORT:-8091}"
         -c "${SPARK_WORKER_CORES:-1}"
         -m "${SPARK_WORKER_MEMORY:-1g}"
         spark://datavault-ingestion-spark-master:7078;
@@ -138,17 +145,18 @@ services:
       - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
       - delta-jars:/opt/delta-jars:ro
       - ext-jars:/opt/ext-jars:ro
-    ports: [ "8084:8084" ]
+    ports: [ "8091:8091" ]
     networks: [ data-automation-net ]
     healthcheck:
-      test: [ "CMD-SHELL", "curl -fsS http://localhost:8084/ > /dev/null || exit 1" ]
+      test: [ "CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/8091 && exec 3>&- 3<&- || exit 1'" ]
       interval: 5s
       timeout: 5s
       retries: 20
       start_period: 5s
 
   datavault-ingestion-spark-worker-2:
-    user: "1001:1001"
+    # user: "1001:1001"
+    user: "0:0"
     image: apache/spark:3.5.6
     container_name: datavault-ingestion-spark-worker-2
     depends_on:
@@ -163,11 +171,14 @@ services:
     environment:
       - SPARK_WORKER_MEMORY=${SPARK_EXECUTOR_MEMORY}
       - SPARK_WORKER_CORES=${SPARK_EXECUTOR_CORES}
-      - SPARK_WORKER_WEBUI_PORT=8085
+      - SPARK_WORKER_WEBUI_PORT=8092
       - KAFKA_BOOTSTRAP_SERVER=kafka:9092
       - SPARK_CLASSPATH=/opt/delta-jars/*:/opt/ext-jars/*
       - UMASK=0002
       - SPARK_WORKER_OPTS=-Dspark.hadoop.fs.permissions.umask-mode=002
+      - SPARK_NO_DAEMONIZE=1
+      - SPARK_LOG_DIR=/tmp/spark/logs
+      - SPARK_PID_DIR=/tmp/spark/pids
     # platform: linux/amd64
     command:
       - /bin/bash
@@ -175,7 +186,7 @@ services:
       - >
         set -Eeuo pipefail;
         /opt/spark/sbin/start-worker.sh
-        --webui-port "${SPARK_WORKER_WEBUI_PORT:-8081}"
+        --webui-port "${SPARK_WORKER_WEBUI_PORT:-8092}"
         -c "${SPARK_WORKER_CORES:-1}"
         -m "${SPARK_WORKER_MEMORY:-1g}"
         spark://datavault-ingestion-spark-master:7078;
@@ -188,17 +199,18 @@ services:
       - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
       - delta-jars:/opt/delta-jars:ro
       - ext-jars:/opt/ext-jars:ro
-    ports: [ "8085:8085" ]
+    ports: [ "8092:8092" ]
     networks: [ data-automation-net ]
     healthcheck:
-      test: [ "CMD-SHELL", "curl -fsS http://localhost:8085/ > /dev/null || exit 1" ]
+      test: [ "CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/8092 && exec 3>&- 3<&- || exit 1'" ]
       interval: 5s
       timeout: 5s
       retries: 20
       start_period: 5s
 
   datavault-ingestion-spark-worker-thrift:
-    user: "1001:1001"
+    # user: "1001:1001"
+    user: "0:0"
     image: apache/spark:3.5.6
     container_name: datavault-ingestion-spark-worker-thrift
     depends_on:
@@ -213,11 +225,14 @@ services:
     environment:
       - SPARK_WORKER_MEMORY=2g
       - SPARK_WORKER_CORES=4
-      - SPARK_WORKER_WEBUI_PORT=18082
+      - SPARK_WORKER_WEBUI_PORT=8093
       - KAFKA_BOOTSTRAP_SERVER=kafka:9092
       - SPARK_CLASSPATH=/opt/delta-jars/*:/opt/ext-jars/*
       - UMASK=0002
       - SPARK_WORKER_OPTS=-Dspark.hadoop.fs.permissions.umask-mode=002
+      - SPARK_NO_DAEMONIZE=1
+      - SPARK_LOG_DIR=/tmp/spark/logs
+      - SPARK_PID_DIR=/tmp/spark/pids
     # platform: linux/amd64
     command:
       - /bin/bash
@@ -225,7 +240,7 @@ services:
       - >
         set -Eeuo pipefail;
         /opt/spark/sbin/start-worker.sh
-        --webui-port "${SPARK_WORKER_WEBUI_PORT:-8081}"
+        --webui-port "${SPARK_WORKER_WEBUI_PORT:-8093}"
         -c "${SPARK_WORKER_CORES:-1}"
         -m "${SPARK_WORKER_MEMORY:-1g}"
         spark://datavault-ingestion-spark-master:7078;
@@ -238,14 +253,14 @@ services:
       - ./hive-site.xml:/opt/spark/conf/hive-site.xml:ro
       - delta-jars:/opt/delta-jars:ro
       - ext-jars:/opt/ext-jars:ro
-    ports: [ "18082:18082" ]
+    ports: [ "8093:8093" ]
     networks: [ data-automation-net ]
     healthcheck:
-      test: [ "CMD-SHELL", "curl -fsS http://localhost:18082/ > /dev/null || exit 1" ]
+      test: [ "CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/8093 && exec 3>&- 3<&- || exit 1'" ]
       interval: 5s
       timeout: 5s
       retries: 20
-      start_period: 5s
+      start_period: 20s
 
 
   datavault-ingestion-spark-thrift:
