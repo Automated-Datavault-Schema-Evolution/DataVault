@@ -27,6 +27,7 @@ from meta_store import write_lineage, write_metadata
 from utils.bronze_ingestor import ensure_bronze_table_exists, start_bronze_writer
 from utils.helper_service_ready import wait_for_lake, wait_for_kafka, wait_for_kafka_increase
 from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir, get_active_stream_query_by_name
+from utils.maintenance.helper_maintenance import maintenance_watchdog
 from utils.performance_logger import PerfListener, log_progress_periodically
 from utils.schema_helpers import bronze_target_columns, infer_schema_from_cdc_event
 
@@ -773,14 +774,13 @@ def main():
                 time.sleep(1)
             except Exception:
                 pass
-            # stream_thread = threading.Thread(
-            #     target=streaming_dv_consumer_and_dbt,
-            #     args=(models_to_run,),
-            #     daemon=True,
-            #     name="dv-streaming-consumer",
-            # )
-            # stream_thread.start()
-
+            # Maintenance watchdog (pause/resume around daily prune)
+            threading.Thread(
+                target=maintenance_watchdog,
+                args=(query, streaming_dv_consumer_and_dbt, (models_to_run,)),
+                daemon=True,
+                name="Maintenance Watchdog",
+            ).start()
         # -------- Phase 3: Initial full load (backlog) --------
         if processing_mode == 'bulk':
             # TODO: IMPLEMENT CRON JOB FRIENDLY PROCESSING ---> SEE DataLake service

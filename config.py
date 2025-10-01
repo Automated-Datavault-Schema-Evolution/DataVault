@@ -85,3 +85,10 @@ DBT_PROFILES_DIR = os.path.join(os.path.dirname(__file__), "profiles")
 DBT_MODELS_JSON_DIR = os.path.join(os.path.dirname(__file__), "models", "json")
 DBT_MODELS_SQL_DIR = os.path.join(os.path.dirname(__file__), "models", "sql")
 
+# prune jobs
+CONTROL_DIR = os.getenv("CONTROL_DIR", "/app/control")
+MAINTENANCE_FLAG = os.path.join(CONTROL_DIR, "PRUNE_REQUEST")   # touch to request pause
+MAINTENANCE_STATUS = os.path.join(CONTROL_DIR, "PRUNE_STATUS")  # 'PAUSED'|'RUNNING'
+RETENTION_DAYS = int(os.getenv("BRONZE_RETENTION_DAYS", "30"))
+VACUUM_RETAIN_HOURS = int(os.getenv("VACUUM_RETAIN_HOURS", "168"))  # 7 days
+BRONZE_SCHEMA = os.getenv("BRONZE_SCHEMA", "bronze")

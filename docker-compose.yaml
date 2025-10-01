@@ -546,6 +546,32 @@ services:
     networks: [ data-automation-net ]
     restart: "no"
 
+  # dv-prune-cron:
+  #   image: docker:27-cli
+  #   container_name: dv-prune-cron
+  #   environment:
+  #     # set to your local tz if you don’t want UTC
+  #     - TZ=Europe/Vienna
+  #     # easy to test: */1 * * * *  (every minute). For 00:20 daily: "20 0 * * *"
+  #     - CRON_SCHEDULE=59 19 * * *
+  #     # name of the app container to exec into
+  #     - TARGET_CONTAINER=DatavaultIngestionHandler
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #     - ./:/app
+  #   entrypoint: [ "/bin/sh","-lc" ]
+  #   command: |
+  #     set -eu
+  #     # ensure tzdata so TZ actually applies
+  #     apk add --no-cache tzdata >/dev/null 2>&1 || true
+  #     # write the crontab (log to file for easy debugging)
+  #     echo "$$CRON_SCHEDULE /bin/sh -lc 'docker exec $$TARGET_CONTAINER /app/scripts/pause_and_prune.sh >> /var/log/cron.log 2>&1'" > /etc/crontabs/root
+  #     echo "[cron] installed: $$(cat /etc/crontabs/root)"
+  #     # foreground, verbose logs
+  #     crond -f -l 8
+  #   restart: unless-stopped
+
+
 
 volumes:
   hive-313-jars: {}
