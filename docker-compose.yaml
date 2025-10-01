@@ -42,6 +42,12 @@ services:
         condition: service_healthy
       warehouse-init:
         condition: service_completed_successfully
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dv-app.rule=PathPrefix(`/spark/dv/app`)
+      - traefik.http.services.dv-app.loadbalancer.server.port=4042
+      - traefik.http.middlewares.dv-app-strip.stripprefix.prefixes=/spark/dv/app
+      - traefik.http.routers.dv-app.middlewares=dv-app-strip
 
 
   datavault-ingestion-spark-master:

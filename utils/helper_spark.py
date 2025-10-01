@@ -97,6 +97,8 @@ def get_spark_session(app_name="Kafka_Consumer_Lake_Handler"):
         # application ui
         .config("spark.ui.enabled", "true")
         .config("spark.ui.port", "4042")
+        .config("spark.ui.reverseProxy", "true")
+        .config("spark.ui.proxyBase", "/spark/dv/app")
     )
 
     if SPARK_DYNAMIC_ALLOCATION:
