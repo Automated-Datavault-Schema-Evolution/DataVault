@@ -185,12 +185,16 @@ def start_bronze_writer(
             if spark.catalog.tableExists(target_table):
                 tgt_schema = spark.table(target_table).schema
                 tgt_cols = [f.name for f in tgt_schema.fields]
+                # Map of lowercase -> actual column name for case-insensitive matching
+                present = {c.lower(): c for c in df.columns}
                 out = df
                 for f in tgt_schema.fields:
-                    if f.name not in out.columns:
+                    src_col = present.get(f.name.lower())
+                    if src_col is None:
                         out = out.withColumn(f.name, F.lit(None).cast(f.dataType))
                     else:
-                        out = out.withColumn(f.name, F.col(f.name).cast(f.dataType))
+                        out = out.withColumn(f.name, F.col(src_col).cast(f.dataType))
+                        present[f.name.lower()] = f.name
                 return out.select(*tgt_cols)
         except Exception as e:
             log.debug("[BRONZE] alignment skipped for %s: %s", target_table, e)
@@ -224,22 +228,14 @@ def start_bronze_writer(
         target = f"{STAGING_SCHEMA}.{tbl}"
         out = _align_to_existing(target, parsed).coalesce(8)
 
-        # Always Delta; auto-create on first append (table must have been pre-registered externally)
-        (
-            out.write.format("delta")
-            .mode("append")
-            .option("mergeSchema", "true")
-            .saveAsTable(target)
-        )
+        (out.write.format("delta")
+         .mode("append")
+         .option("mergeSchema", "true")
+         .saveAsTable(target)
+         )
 
         written = out.count()
         log.info("[BRONZE][%s][batch=%s] written=%s", tbl, batch_id, written)
-
-        if on_after_write:
-            try:
-                on_after_write(tbl, batch_id, written)
-            except Exception as e:
-                log.warning("[BRONZE] on_after_write failed for %s (batch %s): %s", tbl, batch_id, e)
         return written
 
     # Single-table mode
@@ -250,7 +246,13 @@ def start_bronze_writer(
         def _single(batch_df: "DataFrame", batch_id: int):
             bdf = batch_df.persist(StorageLevel.MEMORY_AND_DISK)
             try:
-                _write_one_table(table_name, bdf, batch_id)
+                written = _write_one_table(table_name, bdf, batch_id)
+                if on_after_write:
+                    try:
+                        touched = [table_name] if written > 0 else []
+                        on_after_write(touched, batch_id, {table_name: written} if written > 0 else {})
+                    except Exception as e:
+                        log.warning("[BRONZE] on_after_write failed for batch %s: %s", batch_id, e)
             finally:
                 bdf.unpersist(blocking=False)
 
@@ -296,16 +298,30 @@ def start_bronze_writer(
             .persist(StorageLevel.MEMORY_AND_DISK)
         )
 
+        touched = []
+        per_table_counts = {}
+        total = 0
+
         try:
             tables = [r[0] for r in bdf.select("table").distinct().collect()]
-            total = 0
             for tbl in tables:
                 slice_df = bdf.where(F.col("table") == tbl).persist(StorageLevel.MEMORY_AND_DISK)
                 try:
-                    total += _write_one_table(tbl, slice_df, batch_id)
+                    written = _write_one_table(tbl, slice_df, batch_id)
+                    if written > 0:
+                        touched.append(tbl)
+                        per_table_counts[tbl] = written
+                        total += written
                 finally:
                     slice_df.unpersist(blocking=False)
+
             log.info("[BRONZE][batch=%s] tables=%d total_rows=%d", batch_id, len(tables), total)
+
+            if on_after_write:
+                try:
+                    on_after_write(touched, batch_id, per_table_counts)
+                except Exception as e:
+                    log.warning("[BRONZE] on_after_write failed for batch %s: %s", batch_id, e)
         finally:
             bdf.unpersist(blocking=False)
 
