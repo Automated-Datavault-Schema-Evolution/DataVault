@@ -21,7 +21,8 @@ from config import (
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DBT_PROFILES_DIR, RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER,
     RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, DBT_MODELS_SQL_DIR,
     KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID, STAGING_SCHEMA, RAW_VAULT_SCHEMA, PROCESSING_MODE,
-    KAFKA_MAX_OFFSETS_PER_TRIGGER, RAW_VAULT_BASE_PATH, )
+    KAFKA_MAX_OFFSETS_PER_TRIGGER, RAW_VAULT_BASE_PATH, STAGING_BASE_PATH,
+    DBT_DEBOUNCE_SECONDS, DBT_MAX_MODELS_PER_RUN, STREAM_TRIGGER, )
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
 from utils.bronze_ingestor import ensure_bronze_table_exists, start_bronze_writer
@@ -31,11 +32,20 @@ from utils.maintenance.helper_maintenance import maintenance_watchdog
 from utils.performance_logger import PerfListener, log_progress_periodically
 from utils.schema_helpers import bronze_target_columns, infer_schema_from_cdc_event
 
+import threading
+import time
+from typing import Iterable, Set
+
 _DBT_LOCK = threading.Lock()  # serialize dbt runs during streaming
 
 # ----------- global runtime for graceful shutdown -------------------
 RUN = SimpleNamespace(stop_event=None, query=None, cdc_thread=None)
 
+# Thread-safe set of pending dbt models to run
+_DBT_PENDING_MODELS: Set[str] = set()
+_DBT_PENDING_LOCK = threading.Lock()
+_DBT_WORKER_THREAD: threading.Thread | None = None
+_DBT_WORKER_STOP = threading.Event()
 
 def _graceful_shutdown(signum=None, frame=None):
     """Handle SIGTERM/SIGINT and atexit: stop CDC + drain/stop Spark cleanly."""
@@ -138,6 +148,91 @@ def run_dbt_models(models):
     with _DBT_LOCK:
         subprocess.run(cmd, check=False)
 
+def queue_dbt_models(models: Iterable[str]) -> None:
+    """Collect models to run; actual run is done by the debouncer thread."""
+    if not models:
+        return
+    with _DBT_PENDING_LOCK:
+        for m in models:
+            if m:  # guard against Nones/empties
+                _DBT_PENDING_MODELS.add(m)
+
+def _drain_models(max_models: int | None = None) -> list[str]:
+    """Atomically take up to max_models models from the pending set."""
+    with _DBT_PENDING_LOCK:
+        if not _DBT_PENDING_MODELS:
+            return []
+        if max_models is None or max_models >= len(_DBT_PENDING_MODELS):
+            batch = sorted(_DBT_PENDING_MODELS)
+            _DBT_PENDING_MODELS.clear()
+            return batch
+        # take a bounded slice to avoid huge single runs (optional)
+        batch = sorted(list(_DBT_PENDING_MODELS)[:max_models])
+        _DBT_PENDING_MODELS.difference_update(batch)
+        return batch
+
+def _dbt_worker_loop(interval_seconds: int, max_models_per_run: int) -> None:
+    """Background loop that periodically runs dbt for accumulated models."""
+    log.info("[DBT-DEBOUNCER] started: interval=%ss, max_models_per_run=%s",
+             interval_seconds, max_models_per_run)
+    try:
+        next_wakeup = time.time() + interval_seconds
+        while not _DBT_WORKER_STOP.is_set():
+            now = time.time()
+
+            # If we've hit the max pending models, run immediately.
+            with _DBT_PENDING_LOCK:
+                pending_count = len(_DBT_PENDING_MODELS)
+
+            if pending_count >= max_models_per_run:
+                batch = _drain_models(max_models_per_run)
+                if batch:
+                    log.info("[DBT-DEBOUNCER] early run (size=%s): %s", len(batch), batch)
+                    run_dbt_models(batch)
+                next_wakeup = now + interval_seconds
+
+            # Normal wake-up
+            timeout = max(0.0, next_wakeup - now)
+            _DBT_WORKER_STOP.wait(timeout)
+            if _DBT_WORKER_STOP.is_set():
+                break
+
+            # Periodic run
+            batch = _drain_models(max_models_per_run)
+            if batch:
+                log.info("[DBT-DEBOUNCER] periodic run (size=%s): %s", len(batch), batch)
+                run_dbt_models(batch)
+            next_wakeup = time.time() + interval_seconds
+
+        # Drain anything left on shutdown
+        final = _drain_models(None)
+        if final:
+            log.info("[DBT-DEBOUNCER] draining on shutdown (size=%s): %s", len(final), final)
+            run_dbt_models(final)
+    finally:
+        log.info("[DBT-DEBOUNCER] stopped")
+
+def start_dbt_debouncer() -> None:
+    """Start the debouncer worker thread once."""
+    global _DBT_WORKER_THREAD
+    if _DBT_WORKER_THREAD and _DBT_WORKER_THREAD.is_alive():
+        return
+    t = threading.Thread(
+        target=_dbt_worker_loop,
+        args=(DBT_DEBOUNCE_SECONDS, DBT_MAX_MODELS_PER_RUN),
+        name="dbt-debouncer",
+        daemon=True,
+    )
+    _DBT_WORKER_STOP.clear()
+    t.start()
+    _DBT_WORKER_THREAD = t
+
+def stop_dbt_debouncer() -> None:
+    """Signal the debouncer to stop and wait briefly."""
+    _DBT_WORKER_STOP.set()
+    t = _DBT_WORKER_THREAD
+    if t and t.is_alive():
+        t.join(timeout=15)
 
 def _resolve_thrift(target_cfg):
     """Resolve Hive Thrift connection parameters with env taking precedence."""
@@ -588,43 +683,33 @@ def streaming_dv_consumer_and_dbt(models_to_run):
             return None
 
     def _process_table(batch_df, tbl, epoch_id):
+        """
+        - infers schema for `tbl`
+        - writes Bronze (Delta) for this table
+        - DOES NOT call dbt here (dbt is triggered after batch via debouncer)
+        """
         schema = _infer_schema_from_batch(batch_df) or infer_schema_from_cdc_event(spark, tbl)
         if not schema:
             log.info("[STREAM][%s][epoch=%s] no schema available; skipping", tbl, epoch_id)
-            return
+            return None
 
-        parsed_tbl = batch_df.select(from_json(col("payload"), schema).alias("r")).select("r.*")
-        parsed_tbl = parsed_tbl.coalesce(8)
+        parsed_tbl = batch_df.select(from_json(col("payload"), schema).alias("r")).select("r.*").coalesce(8)
 
         batch_count = parsed_tbl.count()
         if batch_count == 0:
-            log.debug("[BRONZE][%s][epoch=%s] 0 rows in this batch", tbl, epoch_id)
-            return
+            log.debug("[STREAM][%s][epoch=%s] empty micro-batch; skipping", tbl, epoch_id)
+            return None
 
-        # Always Delta, auto-create
-        target_fq = f"{STAGING_SCHEMA}.{tbl}"
-        (parsed_tbl
-         .withColumn("__ingested_at", F.current_timestamp())
-         .withColumn("__record_source", F.lit("kafka_cdc"))
-         .write
+        # Write Bronze (keep your existing write path/options)
+        table_path = os.path.join(STAGING_BASE_PATH, tbl)
+        (parsed_tbl.write
          .format("delta")
          .mode("append")
          .option("mergeSchema", "true")
-         .saveAsTable(target_fq))
-
-        log.info("[BRONZE][%s][epoch=%s] inserted %s row(s)", tbl, epoch_id, batch_count)
-
-        models = table_to_models.get(tbl, [])
-        if models:
-            run_dbt_models(models)
-            for m in models:
-                fq = f"{RAW_VAULT_SCHEMA}.{m}"
-                try:
-                    if spark.catalog.tableExists(fq):
-                        mcnt = spark.table(fq).count()
-                        log.info("[RAW_VAULT][%s] row_count=%s", fq, mcnt)
-                except Exception as e:
-                    log.debug("[RAW_VAULT][%s] count skipped: %s", fq, e)
+         .save(table_path)
+         )
+        log.info("[BRONZE][%s][epoch=%s] wrote %s rows to %s", tbl, epoch_id, batch_count, table_path)
+        return tbl
 
     def _foreach_batch(batch_df, epoch_id: int):
         if batch_df.rdd.isEmpty():
@@ -640,30 +725,26 @@ def streaming_dv_consumer_and_dbt(models_to_run):
             except Exception as e:
                 log.exception("[STREAM][%s][epoch=%s] processing failed: %s", tbl, epoch_id, e)
 
-    trigger_every = os.environ.get("STREAM_TRIGGER", "2 seconds")
+
+    table_to_models = get_existing_model_tables()
 
     # Use your unified writer (now fixed to force Delta)
     # Be tolerant to different callback signatures from bronze_ingestor
-    def _after_write(*args):
-        # Expected: (tbl, batch_id, written); fallback: (tbl,)
+    def _after_write(*args, **kwargs):
+        # Accept (touched,) or (touched, batch_id, counts)
         if not args:
             return
-        if len(args) >= 1:
-            tbl = args[0]
-        else:
+        written_tables = args[0] or []
+        if not written_tables:
             return
 
-        models = table_to_models.get(tbl, [])
+        models = set()
+        for tbl in written_tables:
+            for m in table_to_models.get(tbl, []):
+                models.add(m)
         if models:
-            run_dbt_models(models)
-            for m in models:
-                fq = f"{RAW_VAULT_SCHEMA}.{m}"
-                try:
-                    if spark.catalog.tableExists(fq):
-                        mcnt = spark.table(fq).count()
-                        log.info("[RAW_VAULT][%s] row_count=%s", fq, mcnt)
-                except Exception as e:
-                    log.debug("[RAW_VAULT][%s] count skipped: %s", fq, e)
+            log.info("[DBT-QUEUE] epoch models=%s", sorted(models))
+            queue_dbt_models(models)
 
     allowed_tables = set(table_to_models.keys()) if table_to_models else None
 
@@ -676,16 +757,12 @@ def streaming_dv_consumer_and_dbt(models_to_run):
         on_after_write=_after_write,
         allowed_tables=allowed_tables,
         query_name=f"{KAFKA_TOPIC}-generic-ingestor",
-        trigger_every=trigger_every,
+        trigger_every=STREAM_TRIGGER,
     )
 
     log.info("[STREAM] Query started: id=%s, name=%s, trigger=%s, checkpoint=%s",
-             query.id, query.name, trigger_every, checkpoint_dir)
-    threading.Thread(target=log_progress_periodically, args=(query,), daemon=True).start()
-
-    if models_to_run:
-        log.info("[DBT] Skipping initial run; will trigger models after first micro-batches.")
-
+             query.id, query.name, STREAM_TRIGGER, checkpoint_dir)
+    # threading.Thread(target=log_progress_periodically, args=(query,), daemon=True).start()
     return query
 
 
@@ -748,6 +825,8 @@ def main():
             log.info(f"[DBT] Will run for: {sorted(models_to_run)}")
             # Create raw_vault objects up-front (first run); later runs will also be triggered by streaming callback
             run_dbt_models(sorted(models_to_run))
+        # Start the debounced DBT runner (coalesces per-batch model requests)
+        start_dbt_debouncer()
 
         # -------- Phase 1: Kafka readiness + topic ensure --------
         check_and_create_topic()  # make sure topic exists before streams/producers
@@ -856,7 +935,10 @@ def main():
         except KeyboardInterrupt:
             _graceful_shutdown()
         finally:
-            _graceful_shutdown()
+            try:
+                stop_dbt_debouncer()
+            finally:
+                _graceful_shutdown()
 
 
 if __name__ == "__main__":

@@ -78,6 +78,14 @@ METASTORE_DB_SCHEMA = os.getenv("METASTORE_DB_SCHEMA", 'metastore')
 METASTORE_URI = os.getenv("METASTORE_URI", "thrift://hive-metastore:9083")
 
 
+# How often to run dbt with the coalesced set of models.
+DBT_DEBOUNCE_SECONDS = int(os.getenv("DBT_DEBOUNCE_SECONDS", "60"))
+
+DBT_MAX_MODELS_PER_RUN = int(os.getenv("DBT_MAX_MODELS_PER_RUN", "999999"))
+
+# Default stream trigger; keep your existing env var if you have one.
+STREAM_TRIGGER = os.getenv("STREAM_TRIGGER", "2 seconds")
+
 PROCESSING_MODE = os.getenv("PROCESSING_MODE", "streaming")
 
 # DBT
