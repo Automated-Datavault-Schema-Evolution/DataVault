@@ -4,16 +4,16 @@
 .venv
 *.env.*
 /artifacts
-/models
+!/models
 *.json
 *.parquet
 
-/target
-/logs
-/metastore_db
-/data
-/meta
-/control
+!/target/
+!/logs/
+!/metastore_db/
+!/data/
+!/meta/
+!/control
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
