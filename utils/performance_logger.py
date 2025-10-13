@@ -4,7 +4,7 @@ import time
 from logger import log
 from pyspark.sql.streaming import StreamingQueryListener
 
-
+# TODO: find usefull timeinterval for logging, so its not too noisy
 def log_progress_periodically(q, interval=30):
     def _loop():
         while q.isActive:
