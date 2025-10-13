@@ -30,35 +30,33 @@ RUN groupadd -g ${APP_GID} ${APP_GROUP} || true && \
 # ============================
 # Dirs used at runtime
 # ============================
-# Create data lake dirs (match  code & logs) and ivy cache dir
-    # make them writable by the runtime user
-RUN mkdir -p /data/raw_vault /data/bronze /data/checkpoints /data/spark/warehouse /tmp/.ivy2 && \
-    chown -R ${APP_UID}:${APP_GID} /data /tmp
+# Create data lake dirs (match code & logs) and ivy cache dir with correct ownership
+RUN install -d -m 2775 -o ${APP_UID} -g ${APP_GID} \
+      /data/raw_vault /data/bronze /data/checkpoints /data/spark/warehouse /tmp/.ivy2
 
-# Silence root warning from pip
-ENV PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# Silence root warning from pip, speed up Python
+ENV PIP_ROOT_USER_ACTION=ignore \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 # ============================
 # App setup
 # ============================
 WORKDIR /app
 
-# Python deps
+# Python deps (keep this before copying source to leverage cache)
 COPY requirements.txt ./requirements.txt
 RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# App code + env
-COPY . /app
-COPY .env.docker /app/.env.docker
+# App code + env (copy with correct ownership to avoid slow chown)
+COPY --chown=${APP_UID}:${APP_GID} . /app
+COPY --chown=${APP_UID}:${APP_GID} .env.docker /app/.env.docker
 
 # Keep Ivy happy and mirror env knobs
 ENV ENV_TYPE=docker \
     SPARK_IVY_PATH=/tmp/.ivy2
-
-# Make sure runtime user owns the app dir too
-RUN chown -R ${APP_UID}:${APP_GID} /app
 
 # Drop privileges
 USER ${APP_UID}:${APP_GID}
