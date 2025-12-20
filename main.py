@@ -47,6 +47,10 @@ _DBT_PENDING_LOCK = threading.Lock()
 _DBT_WORKER_THREAD: threading.Thread | None = None
 _DBT_WORKER_STOP = threading.Event()
 
+# gRPC server threading primitives
+VAULT_GRPC_STOP_EVENT = threading.Event()
+VAULT_GRPC_THREAD: threading.Thread | None = None
+
 def _graceful_shutdown(signum=None, frame=None):
     """Handle SIGTERM/SIGINT and atexit: stop CDC + drain/stop Spark cleanly."""
     try:
@@ -83,6 +87,17 @@ def _graceful_shutdown(signum=None, frame=None):
         t = getattr(RUN, "cdc_thread", None)
         if t is not None and t.is_alive():
             t.join(timeout=20)
+    except Exception:
+        pass
+
+    try:
+        VAULT_GRPC_STOP_EVENT.set()
+    except Exception:
+        pass
+
+    try:
+        if VAULT_GRPC_THREAD is not None and VAULT_GRPC_THREAD.is_alive():
+            VAULT_GRPC_THREAD.join(timeout=5)
     except Exception:
         pass
 
@@ -942,4 +957,17 @@ def main():
 
 
 if __name__ == "__main__":
+    from dv_grpc_service import serve as serve_vault_grpc
+
+    # Start Vault gRPC server in a background daemon thread
+    VAULT_GRPC_THREAD = threading.Thread(
+        target=serve_vault_grpc,
+        args=(VAULT_GRPC_STOP_EVENT,),
+        daemon=True,
+        name="vault-grpc-server",
+    )
+    VAULT_GRPC_THREAD.start()
+    log.info("Vault gRPC server thread started.")
+
+    # Start the existing orchestrator / streaming logic
     main()
