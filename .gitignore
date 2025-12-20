@@ -4,7 +4,9 @@
 .venv
 *.env.*
 /artifacts
-!/models
+!/models/json
+/models/sql
+/models/schema.yml
 *.json
 *.parquet
 
