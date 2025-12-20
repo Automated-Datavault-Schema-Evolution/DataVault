@@ -8,4 +8,7 @@ kafka-python-ng==2.2.2
 psycopg2-binary
 pyarrow
 fastparquet
+grpcio
+grpcio-tools
+protobuf>=4.25.0
 git+https://github.com/Automated-Datavault-Schema-Evolution/MyLogger.git@v0.2.1#egg=mylogger
