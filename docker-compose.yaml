@@ -11,7 +11,7 @@ services:
       ssh:
         - default
     container_name: DatavaultIngestionHandler
-    env_file: .env.docker
+    env_file: .env
     volumes:
       - ./:/app
       - ${HOST_DATA_DIRECTORY}:${CONTAINER_DATA_DIR}

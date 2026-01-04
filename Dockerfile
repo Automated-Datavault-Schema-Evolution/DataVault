@@ -52,7 +52,7 @@ RUN python -m pip install --upgrade pip && \
 
 # App code + env (copy with correct ownership to avoid slow chown)
 COPY --chown=${APP_UID}:${APP_GID} . /app
-COPY --chown=${APP_UID}:${APP_GID} .env.docker /app/.env.docker
+COPY --chown=${APP_UID}:${APP_GID} .env /app/.env.docker
 
 # Keep Ivy happy and mirror env knobs
 ENV ENV_TYPE=docker \

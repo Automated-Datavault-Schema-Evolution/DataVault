@@ -48,8 +48,5 @@ k8s/
 # Keep control folder out if it’s local-only
 control/
 
-# Prevent the bulk COPY from grabbing your env file;
-# we COPY it explicitly in the Dockerfile when needed
-.env
-.env.local
-.env.docker
+
+docker run -d --name dozzle -p 6060:8080 -v /var/run/docker.sock:/var/run/docker.sock amir20/dozzle

@@ -6,7 +6,7 @@ import json
 import os
 import re
 from concurrent import futures
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import grpc
 import threading
@@ -467,14 +467,15 @@ def _handle_new_link_for_vault(operation: pb.Operation) -> pb.OperationResult:
 
     if not candidates:
         msg = f"[GRPC_SERVICE] No link candidates found for table {table_name!r} (fk_filter={fk_filter!r})"
-        log.error(msg)
+        log.warnin(msg)
         return pb.OperationResult(
             correlation_id=operation.correlation_id,
             plan_id=operation.plan_id,
             idempotency_key=operation.idempotency_key,
-            status=pb.OPERATION_STATUS_PERMANENT_ERROR,
+            status=pb.OPERATION_STATUS_ALREADY_APPLIED,
             error_code="NO_LINK_CANDIDATE",
-            error_message=msg,
+            error_message="",
+            evidence_snapshot_id=_make_evidence_id(operation),
         )
 
     models = _load_models_for_table(table_name)
@@ -555,6 +556,60 @@ def _handle_new_link_for_vault(operation: pb.Operation) -> pb.OperationResult:
         evidence_snapshot_id=evidence_id,
     )
 
+def _handle_change_type_for_vault(operation: pb.Operation) -> pb.OperationResult:
+    params = dict(operation.params)
+    column_name = params.get("column_name")
+    if not column_name:
+        return pb.OperationResult(
+            correlation_id=operation.correlation_id,
+            plan_id=operation.plan_id,
+            idempotency_key=operation.idempotency_key,
+            status=pb.OPERATION_STATUS_PERMANENT_ERROR,
+            error_code="MISSING_PARAM",
+            error_message="column_name parameter is required for OPERATION_CHANGE_TYPE",
+        )
+
+    if not operation.target:
+        return pb.OperationResult(
+            correlation_id=operation.correlation_id,
+            plan_id=operation.plan_id,
+            idempotency_key=operation.idempotency_key,
+            status=pb.OPERATION_STATUS_PERMANENT_ERROR,
+            error_code="MISSING_TARGET",
+            error_message="target (table_name) is required for OPERATION_CHANGE_TYPE",
+        )
+
+    evidence_id = _make_evidence_id(operation)
+    return pb.OperationResult(
+        correlation_id=operation.correlation_id,
+        plan_id=operation.plan_id,
+        idempotency_key=operation.idempotency_key,
+        status=pb.OPERATION_STATUS_ALREADY_APPLIED,
+        error_code="",
+        error_message="",
+        evidence_snapshot_id=evidence_id,
+    )
+
+
+def _compute_link_candidates(table_name: str, fk_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Compute link candidates for a lake table using the same discovery + modelling
+    logic as OPERATION_NEW_LINK, but without any side effects.
+
+    Returns: list of link dicts, each expected to contain:
+      - name: str
+      - keys: List[str]  (e.g. [hub_key, fk_column])
+    """
+    meta, hubs, links, sats = _discover_and_split(table_name)
+
+    candidates: List[Dict[str, Any]] = []
+    for l in links:
+        keys = list(l.get("keys") or [])
+        if fk_filter and (len(keys) < 2 or keys[1] != fk_filter):
+            continue
+        candidates.append(l)
+
+    return candidates
 
 # ---------------------------------------------------------------------------
 # Evidence introspection
@@ -629,6 +684,8 @@ class VaultHandlerService(pb_grpc.VaultHandlerServicer):
                 result = _handle_new_hub_for_vault(op)
             elif op.kind == pb.OPERATION_NEW_LINK:
                 result = _handle_new_link_for_vault(op)
+            elif op.kind == pb.OPERATION_CHANGE_TYPE:
+                result = _handle_change_type_for_vault(op)
             else:
                 msg = f"[GRPC_SERVICE] Operation kind {kind_name} not supported by VaultHandler"
                 log.error(msg)
@@ -702,6 +759,56 @@ class VaultHandlerService(pb_grpc.VaultHandlerServicer):
             vault_structures=pb_vaults,
             raw_evidence_json=json.dumps(raw),
         )
+
+    def ProbeLinkCandidates(
+            self,
+            request: pb.LinkProbeRequest,
+            context: grpc.ServicerContext,
+    ) -> pb.LinkProbeResponse:
+        table_name = request.table_name
+        fk_filter = request.fk_filter or None
+
+        log.info(
+            f"[GRPC_SERVICE] VaultHandler.ProbeLinkCandidates: plan_id={request.plan_id} "
+            f"correlation_id={request.correlation_id} table_name={table_name} fk_filter={fk_filter}"
+        )
+
+        if not table_name:
+            return pb.LinkProbeResponse(
+                correlation_id=request.correlation_id,
+                plan_id=request.plan_id,
+                candidates=[],
+                error_code="MISSING_TABLE_NAME",
+                error_message="table_name is required",
+            )
+
+        try:
+            candidates = _compute_link_candidates(table_name, fk_filter=fk_filter)
+            pb_candidates = [
+                pb.LinkCandidate(
+                    name=str(c.get("name") or ""),
+                    keys=[str(x) for x in (c.get("keys") or [])],
+                )
+                for c in candidates
+            ]
+            return pb.LinkProbeResponse(
+                correlation_id=request.correlation_id,
+                plan_id=request.plan_id,
+                candidates=pb_candidates,
+                error_code="",
+                error_message="",
+            )
+        except Exception as exc:
+            # Important: discovery can fail transiently if the lake table isn't created yet.
+            msg = f"ProbeLinkCandidates failed for table {table_name!r}: {exc}"
+            log.warning("[GRPC_SERVICE] %s", msg)
+            return pb.LinkProbeResponse(
+                correlation_id=request.correlation_id,
+                plan_id=request.plan_id,
+                candidates=[],
+                error_code="DV_DISCOVERY_FAILED",
+                error_message=msg,
+            )
 
 
 def serve(stop_event: "threading.Event | None" = None) -> None:

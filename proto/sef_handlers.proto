@@ -32,6 +32,30 @@ enum OperationStatus {
   OPERATION_STATUS_PERMANENT_ERROR   = 4;
 }
 
+// --- Link candidate probe (Vault) ---
+
+message LinkProbeRequest {
+  string correlation_id = 1;
+  string plan_id        = 2;
+  string table_name     = 3;
+  string fk_filter      = 4; // optional
+}
+
+message LinkCandidate {
+  string name = 1;
+  repeated string keys = 2;
+}
+
+message LinkProbeResponse {
+  string correlation_id = 1;
+  string plan_id        = 2;
+  repeated LinkCandidate candidates = 3;
+
+  // Non-empty only if the probe could not run (e.g. lake table not yet present).
+  string error_code     = 4;
+  string error_message  = 5;
+}
+
 // Common structures
 
 message AttributeDescriptor {
@@ -112,4 +136,6 @@ service LakeHandler {
 service VaultHandler {
   rpc ApplyOperations   (OperationBatch)  returns (OperationBatchResult);
   rpc IntrospectEvidence(EvidenceRequest) returns (EvidenceResponse);
+  rpc ProbeLinkCandidates(LinkProbeRequest) returns (LinkProbeResponse);
+
 }

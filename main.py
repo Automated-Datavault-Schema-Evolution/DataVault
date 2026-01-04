@@ -473,15 +473,23 @@ def write_json_model_file(model_name, table_name, model_type, meta):
 
 
 def generate_schema_yml(table_names, output_path="models/schema.yml"):
+    table_names = list(table_names or [])
+
     lines = []
     lines.append("version: 2")
     lines.append("")
     lines.append("sources:")
     lines.append("  - name: staging")
     lines.append('    schema: "{{ env_var(\'STAGING_SCHEMA\', \'bronze\') }}"')
-    lines.append("    tables:")
-    for t in table_names:
-        lines.append(f"      - name: {t}")
+
+    if table_names:
+        lines.append("    tables:")
+        for t in table_names:
+            lines.append(f"      - name: {t}")
+    else:
+        # Critical: do NOT emit "tables:" with no items (YAML => null).
+        lines.append("    tables: []")
+
     write_text_if_changed(output_path, "\n".join(lines) + "\n")
 
 

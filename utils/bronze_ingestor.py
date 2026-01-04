@@ -169,7 +169,7 @@ def start_bronze_writer(
     if df_stream is None:
         log.warning("[BRONZE] No stream; skipping writer")
         return None
-
+    _ensure_db(spark)
     def _infer_all_string_schema_from_sample_json(sample_json: str):
         try:
             obj = json.loads(sample_json)

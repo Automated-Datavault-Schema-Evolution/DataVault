@@ -29,7 +29,7 @@ from config import (
 
 # TODO: REFACTOR!! --> EITHER DELETE AND ONLY RUN IN DOCKER, OR CHANGE LOGIC FOR DYNAMIC PATHS IN env-file
 def _pick_warehouse_dir() -> Path:
-    is_local = str(SPARK_MASTER).startswith("local") or os.getenv("ENV_TYPE", "local") == "local"
+    is_local = str(SPARK_MASTER).startswith("local") and os.getenv("ENV_TYPE", "local") == "local"
     base = HOST_SPARK_WAREHOUSE_DIR if is_local else CONTAINER_WAREHOUSE_DIR
     return Path(base).resolve()
 
