@@ -261,57 +261,140 @@ def _resolve_thrift(target_cfg):
 
 
 def discover_lake():
-    """Return available lake tables and a loader function."""
-    log.debug(f"LAKE_TYPE: {LAKE_TYPE}")
-    if LAKE_TYPE == "parquet":
-        tables = [f[:-8] for f in os.listdir(PARQUET_PATH) if f.endswith(".parquet")]
+    """
+    Discover lake tables and return:
+      - tables: List[str]
+      - load_table: Callable[[table_name], pandas.DataFrame(columns=[...])]
 
-        def load_table(t):
-            path = os.path.join(PARQUET_PATH, t + ".parquet")
-            # read just schema if pyarrow is available; otherwise use head(0)
-            try:
-                import pyarrow.parquet as pq
-                pf = pq.ParquetFile(path)
-                cols = list(pf.schema.names)
-                return pd.DataFrame(columns=cols)
-            except Exception:
-                return pd.read_parquet(path).head(0)
-    elif LAKE_TYPE == "rdbms":
-        import psycopg2
+    RDBMS mode: introspects Postgres information_schema.
+    PARQUET mode: treats PARQUET_PATH as a *Delta Lake root* (e.g. /lake) and discovers
+                  per-table directories containing _delta_log/.
+    """
+    import json
+    import os
+    from pathlib import Path
+
+    import pandas as pd
+    import pyarrow.parquet as pq
+
+    if LAKE_TYPE == "rdbms":
+        # ---- existing behaviour (unchanged) ----
         from psycopg2 import sql
-        conn = psycopg2.connect(
-            host=RDBMS_HOST, port=RDBMS_PORT,
-            dbname=RDBMS_DB, user=RDBMS_USER, password=RDBMS_PASSWORD
-        )
+
+        conn = connect_postgres()
         cur = conn.cursor()
         cur.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = %s AND table_type = %s",
-            (RDBMS_SCHEMA, "BASE TABLE")
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = %s
+              AND table_type = 'BASE TABLE'
+            ORDER BY table_name
+            """,
+            (RDBMS_SCHEMA,),
         )
-        tables = [row[0] for row in cur.fetchall()]
+        tables = [r[0] for r in cur.fetchall()]
         cur.close()
         conn.close()
 
-        def load_table(t):
-            conn = psycopg2.connect(
-                host=RDBMS_HOST, port=RDBMS_PORT,
-                dbname=RDBMS_DB, user=RDBMS_USER, password=RDBMS_PASSWORD
-            )
-            cur = conn.cursor()
+        def load_table(t: str) -> pd.DataFrame:
+            conn2 = connect_postgres()
+            cur2 = conn2.cursor()
             q = sql.SQL("SELECT * FROM {}.{} LIMIT 1").format(
                 sql.Identifier(RDBMS_SCHEMA), sql.Identifier(t)
             )
-            cur.execute(q)
-            cols = [desc[0] for desc in cur.description]
-            cur.close()
-            conn.close()
+            cur2.execute(q)
+            cols = [desc[0] for desc in cur2.description]
+            cur2.close()
+            conn2.close()
             return pd.DataFrame(columns=cols)
 
         return tables, load_table
-    else:
-        raise ValueError(f"Unsupported LAKE_TYPE: {LAKE_TYPE}")
+
+    # ------------------------------
+    # PARQUET MODE (Delta root)
+    # ------------------------------
+    lake_root = Path(PARQUET_PATH)
+
+    if not lake_root.exists():
+        log.warning(f"[discover_lake] PARQUET_PATH does not exist: {lake_root}")
+        return [], (lambda _: pd.DataFrame())
+
+    def _is_delta_table_dir(p: Path) -> bool:
+        return p.is_dir() and (p / "_delta_log").is_dir()
+
+    def _latest_delta_log_json(delta_log_dir: Path) -> Path | None:
+        """
+        Delta log consists of JSON commit files like 00000000000000000010.json.
+        We pick the highest-numbered JSON file available.
+        """
+        json_files = sorted(delta_log_dir.glob("*.json"))
+        return json_files[-1] if json_files else None
+
+    def _schema_from_delta_log(table_dir: Path) -> list[str] | None:
+        """
+        Parse schemaString from the delta commit JSON.
+        The commit file is newline-delimited JSON objects.
+        We find the first object containing 'metaData' with 'schemaString'.
+        """
+        delta_log_dir = table_dir / "_delta_log"
+        commit = _latest_delta_log_json(delta_log_dir)
+        if not commit:
+            return None
+
+        try:
+            with commit.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    md = obj.get("metaData")
+                    if md and "schemaString" in md:
+                        schema_str = md["schemaString"]
+                        schema_obj = json.loads(schema_str)
+                        fields = schema_obj.get("fields", [])
+                        return [fld.get("name") for fld in fields if fld.get("name")]
+        except Exception as e:
+            log.warning(f"[discover_lake] Failed to parse delta log schema for {table_dir}: {e}")
+
+        return None
+
+    def _fallback_schema_from_parquet(table_dir: Path) -> list[str] | None:
+        """
+        If delta log parsing fails, find any parquet file under the table directory
+        and read its schema (fast metadata only).
+        """
+        try:
+            for pf in table_dir.rglob("*.parquet"):
+                pf = pf.resolve()
+                meta = pq.read_metadata(str(pf))
+                return meta.schema.names
+        except Exception as e:
+            log.warning(f"[discover_lake] Fallback parquet schema failed for {table_dir}: {e}")
+        return None
+
+    # Discover delta tables in root
+    table_dirs = [p for p in lake_root.iterdir() if _is_delta_table_dir(p)]
+    tables = sorted([p.name for p in table_dirs])
+
+    def load_table(table_name: str) -> pd.DataFrame:
+        table_dir = lake_root / table_name
+        if not _is_delta_table_dir(table_dir):
+            log.warning(f"[discover_lake] Table not found or not a delta table: {table_dir}")
+            return pd.DataFrame()
+
+        cols = _schema_from_delta_log(table_dir)
+        if cols is None:
+            cols = _fallback_schema_from_parquet(table_dir)
+
+        if not cols:
+            return pd.DataFrame()
+
+        return pd.DataFrame(columns=cols)
 
     return tables, load_table
+
 
 
 def ensure_database_schema():

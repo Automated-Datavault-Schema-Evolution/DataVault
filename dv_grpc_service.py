@@ -557,8 +557,15 @@ def _handle_new_link_for_vault(operation: pb.Operation) -> pb.OperationResult:
     )
 
 def _handle_change_type_for_vault(operation: pb.Operation) -> pb.OperationResult:
+    """
+    Vault is non-destructive. For CHANGE_TYPE we:
+      - record evidence
+      - rerun dbt models for the table (safe, idempotent)
+    """
     params = dict(operation.params)
     column_name = params.get("column_name")
+    table_name = operation.target
+
     if not column_name:
         return pb.OperationResult(
             correlation_id=operation.correlation_id,
@@ -569,7 +576,7 @@ def _handle_change_type_for_vault(operation: pb.Operation) -> pb.OperationResult
             error_message="column_name parameter is required for OPERATION_CHANGE_TYPE",
         )
 
-    if not operation.target:
+    if not table_name:
         return pb.OperationResult(
             correlation_id=operation.correlation_id,
             plan_id=operation.plan_id,
@@ -580,16 +587,171 @@ def _handle_change_type_for_vault(operation: pb.Operation) -> pb.OperationResult
         )
 
     evidence_id = _make_evidence_id(operation)
-    return pb.OperationResult(
-        correlation_id=operation.correlation_id,
-        plan_id=operation.plan_id,
-        idempotency_key=operation.idempotency_key,
-        status=pb.OPERATION_STATUS_ALREADY_APPLIED,
-        error_code="",
-        error_message="",
-        evidence_snapshot_id=evidence_id,
-    )
 
+    try:
+        models = _load_models_for_table(table_name)
+        model_names = [m.get("model_name") for m in models if m.get("model_name")]
+        if model_names:
+            run_dbt_models(model_names)
+
+        write_metadata(
+            {
+                "layer": "vault",
+                "target": table_name,
+                "plan_id": operation.plan_id,
+                "correlation_id": operation.correlation_id,
+                "idempotency_key": operation.idempotency_key,
+                "operation_kind": "CHANGE_TYPE",
+                "params": params,
+                "evidence_id": evidence_id,
+                "models_rerun": model_names,
+                "note": "non-destructive; reran models to align with lake typing",
+            }
+        )
+
+        return pb.OperationResult(
+            correlation_id=operation.correlation_id,
+            plan_id=operation.plan_id,
+            idempotency_key=operation.idempotency_key,
+            status=pb.OPERATION_STATUS_OK,
+            error_code="",
+            error_message="",
+            evidence_snapshot_id=evidence_id,
+        )
+    except Exception as exc:
+        msg = f"Vault CHANGE_TYPE failed for {table_name}.{column_name}: {exc}"
+        log.exception("[GRPC_SERVICE] %s", msg)
+        return pb.OperationResult(
+            correlation_id=operation.correlation_id,
+            plan_id=operation.plan_id,
+            idempotency_key=operation.idempotency_key,
+            status=pb.OPERATION_STATUS_TRANSIENT_ERROR,
+            error_code="DV_CHANGE_TYPE_FAILED",
+            error_message=msg,
+            evidence_snapshot_id=evidence_id,
+        )
+
+
+def _handle_drop_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
+    """
+    Non-destructive handling of DROP_COLUMN in the vault:
+      - Re-discover DV templates from the current lake schema.
+      - Ensure side-by-side variants exist where shapes changed (esp. satellites).
+      - Never drop existing vault tables (non-destructive).
+    """
+    params = dict(operation.params)
+    column_name = params.get("column_name")
+    table_name = operation.target
+
+    if not column_name:
+        return pb.OperationResult(
+            correlation_id=operation.correlation_id,
+            plan_id=operation.plan_id,
+            idempotency_key=operation.idempotency_key,
+            status=pb.OPERATION_STATUS_PERMANENT_ERROR,
+            error_code="MISSING_PARAM",
+            error_message="column_name parameter is required for OPERATION_DROP_COLUMN",
+        )
+
+    if not table_name:
+        return pb.OperationResult(
+            correlation_id=operation.correlation_id,
+            plan_id=operation.plan_id,
+            idempotency_key=operation.idempotency_key,
+            status=pb.OPERATION_STATUS_PERMANENT_ERROR,
+            error_code="MISSING_TARGET",
+            error_message="target (table_name) is required for OPERATION_DROP_COLUMN",
+        )
+
+    evidence_id = _make_evidence_id(operation)
+
+    try:
+        meta, hubs, links, sats = _discover_and_split(table_name)
+        models_for_table = _load_models_for_table(table_name)
+
+        created_models: List[str] = []
+
+        # Ensure hub(s) (versioning logic already exists in NEW_HUB handler; reuse its internals by calling it)
+        if hubs:
+            # Call the existing hub handler logic (it is non-destructive and version-aware)
+            hub_res = _handle_new_hub_for_vault(
+                pb.Operation(
+                    correlation_id=operation.correlation_id,
+                    plan_id=operation.plan_id,
+                    idempotency_key=f"{operation.idempotency_key}:hub",
+                    layer=pb.LAYER_VAULT,
+                    kind=pb.OPERATION_NEW_HUB,
+                    target=table_name,
+                    params=params,
+                )
+            )
+            # NEW_HUB handler runs dbt itself; but we still track any generated model via metadata later.
+            # We do not treat hub_res status as fatal unless permanent error.
+            if hub_res.status == pb.OPERATION_STATUS_PERMANENT_ERROR:
+                return hub_res
+
+        # Ensure satellites (this is the key non-destructive behavior for DROP_COLUMN)
+        if sats:
+            sat_template = sats[0]
+            created, already_present = _ensure_satellite_for_table(table_name, sat_template, models_for_table)
+            created_models.extend(created)
+
+        # Ensure links (version-aware NEW_LINK handler; reuse similarly)
+        if links:
+            link_res = _handle_new_link_for_vault(
+                pb.Operation(
+                    correlation_id=operation.correlation_id,
+                    plan_id=operation.plan_id,
+                    idempotency_key=f"{operation.idempotency_key}:link",
+                    layer=pb.LAYER_VAULT,
+                    kind=pb.OPERATION_NEW_LINK,
+                    target=table_name,
+                    params=params,
+                )
+            )
+            if link_res.status == pb.OPERATION_STATUS_PERMANENT_ERROR:
+                return link_res
+
+        if created_models:
+            run_dbt_models(created_models)
+
+        write_metadata(
+            {
+                "layer": "vault",
+                "target": table_name,
+                "plan_id": operation.plan_id,
+                "correlation_id": operation.correlation_id,
+                "idempotency_key": operation.idempotency_key,
+                "operation_kind": "DROP_COLUMN",
+                "params": params,
+                "evidence_id": evidence_id,
+                "created_models": created_models,
+                "note": "non-destructive; created side-by-side variants if needed",
+            }
+        )
+
+        return pb.OperationResult(
+            correlation_id=operation.correlation_id,
+            plan_id=operation.plan_id,
+            idempotency_key=operation.idempotency_key,
+            status=pb.OPERATION_STATUS_OK if created_models else pb.OPERATION_STATUS_ALREADY_APPLIED,
+            error_code="",
+            error_message="",
+            evidence_snapshot_id=evidence_id,
+        )
+
+    except Exception as exc:
+        msg = f"Vault DROP_COLUMN failed for {table_name}.{column_name}: {exc}"
+        log.exception("[GRPC_SERVICE] %s", msg)
+        return pb.OperationResult(
+            correlation_id=operation.correlation_id,
+            plan_id=operation.plan_id,
+            idempotency_key=operation.idempotency_key,
+            status=pb.OPERATION_STATUS_TRANSIENT_ERROR,
+            error_code="DV_DROP_FAILED",
+            error_message=msg,
+            evidence_snapshot_id=evidence_id,
+        )
 
 def _compute_link_candidates(table_name: str, fk_filter: Optional[str] = None) -> List[Dict[str, Any]]:
     """
@@ -686,6 +848,8 @@ class VaultHandlerService(pb_grpc.VaultHandlerServicer):
                 result = _handle_new_link_for_vault(op)
             elif op.kind == pb.OPERATION_CHANGE_TYPE:
                 result = _handle_change_type_for_vault(op)
+            elif op.kind == pb.OPERATION_DROP_COLUMN:
+                result = _handle_drop_column_for_vault(op)
             else:
                 msg = f"[GRPC_SERVICE] Operation kind {kind_name} not supported by VaultHandler"
                 log.error(msg)
