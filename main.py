@@ -13,6 +13,7 @@ import pandas as pd
 import yaml
 from jinja2 import Template
 from logger import log
+from psycopg2.pool import SimpleConnectionPool
 from pyhive import hive
 
 from cdc_kafka_producer import cdc_producer_insert_only, produce_tables_once, check_and_create_topic
@@ -22,7 +23,7 @@ from config import (
     RDBMS_PASSWORD, RDBMS_SCHEMA, DBT_MODELS_JSON_DIR, THRIFT_HOST, THRIFT_PORT, DBT_MODELS_SQL_DIR,
     KAFKA_STARTING_OFFSETS, KAFKA_GROUP_ID, STAGING_SCHEMA, RAW_VAULT_SCHEMA, PROCESSING_MODE,
     KAFKA_MAX_OFFSETS_PER_TRIGGER, RAW_VAULT_BASE_PATH, STAGING_BASE_PATH,
-    DBT_DEBOUNCE_SECONDS, DBT_MAX_MODELS_PER_RUN, STREAM_TRIGGER, )
+    DBT_DEBOUNCE_SECONDS, DBT_MAX_MODELS_PER_RUN, STREAM_TRIGGER, POSTGRES_POOL_MAX, POSTGRES_POOL_MIN)
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
 from utils.bronze_ingestor import ensure_bronze_table_exists, start_bronze_writer
@@ -37,6 +38,7 @@ import time
 from typing import Iterable, Set
 
 _DBT_LOCK = threading.Lock()  # serialize dbt runs during streaming
+PG_POOL = None
 
 # ----------- global runtime for graceful shutdown -------------------
 RUN = SimpleNamespace(stop_event=None, query=None, cdc_thread=None)
@@ -150,15 +152,55 @@ def run_dbt_models(models):
     """Run dbt for the specified models."""
     if not models:
         return
+
     ensure_profiles_dir()
+
+    # --- Ensure dbt sources include any lake tables referenced by these models ---
+    # We infer the lake table name from each model's JSON metadata.
+    schema_path = os.path.join(os.path.dirname(__file__), "models", "schema.yml")
+
+    referenced_tables = set()
+    for m in models:
+        meta_path = os.path.join(DBT_MODELS_JSON_DIR, f"{m}.json")
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                j = json.load(f)
+            t = (j.get("table_name") or "").strip()
+            if t:
+                referenced_tables.add(t)
+        except FileNotFoundError:
+            # Model might exist as SQL only; ignore.
+            continue
+        except Exception as e:
+            log.warning(f"[DBT] Could not read model metadata for {m}: {e}")
+
+    # Merge with any existing schema.yml tables (so we don't thrash the file)
+    existing_tables = set()
+    try:
+        if os.path.exists(schema_path):
+            with open(schema_path, "r", encoding="utf-8") as f:
+                doc = yaml.safe_load(f) or {}
+            for src in (doc.get("sources") or []):
+                if (src.get("name") == "staging") and isinstance(src.get("tables"), list):
+                    for t in src["tables"]:
+                        if isinstance(t, dict) and t.get("name"):
+                            existing_tables.add(str(t["name"]))
+    except Exception as e:
+        log.warning(f"[DBT] Could not parse existing schema.yml (will regenerate): {e}")
+
+    merged = sorted(existing_tables.union(referenced_tables))
+    generate_schema_yml(merged, output_path=schema_path)
+
     cmd = [
-              "dbt",
-              "run",
-              "--profiles-dir",
-              DBT_PROFILES_DIR,
-              "--select",
-          ] + sorted(models)
+        "dbt",
+        "run",
+        "--profiles-dir",
+        DBT_PROFILES_DIR,
+        "--select",
+    ] + sorted(models)
+
     log.info(f"[DBT] Running: {cmd}")
+
     # use check=False to keep app running even if some models fail
     with _DBT_LOCK:
         subprocess.run(cmd, check=False)
@@ -260,6 +302,84 @@ def _resolve_thrift(target_cfg):
     return host, port, user
 
 
+def init_postgres_pool(minconn=None, maxconn=None):
+    """
+    Initialize and return a global psycopg2 connection pool.
+    This pool will be used by all threads.
+    """
+    global PG_POOL
+    if minconn is None:
+        minconn = POSTGRES_POOL_MIN
+    if maxconn is None:
+        maxconn = POSTGRES_POOL_MAX
+    if PG_POOL is None:
+        try:
+            PG_POOL = SimpleConnectionPool(
+                minconn,
+                maxconn,
+                host=RDBMS_HOST,
+                port=RDBMS_PORT,
+                dbname=RDBMS_DB,
+                user=RDBMS_USER,
+                password=RDBMS_PASSWORD,
+            )
+            log.info(f"PostgreSQL connection pool created (min={minconn}, max={maxconn}).")
+        except Exception as e:
+            log.error(f"Error establishing PostgreSQL connection pool: {e}")
+            raise
+    else:
+        log.debug("Reusing existing PostgreSQL connection pool.")
+    return PG_POOL
+
+
+def connect_postgres():
+    """
+        Get a connection from the pool.
+        """
+    pool = init_postgres_pool()
+    try:
+        conn = pool.getconn()
+        if conn.closed:
+            log.warning("Received closed connection from pool; replacing it.")
+            pool.putconn(conn, close=True)
+            conn = pool.getconn()
+        log.debug("Acquired connection from pool.")
+        return conn
+    except Exception as e:
+        msg = str(e)
+        if "connection pool exhausted" in msg.lower():
+            new_max = pool.maxconn + 5
+            log.warning(
+                f"Connection pool exhausted. Expanding pool to {new_max} connections."
+            )
+            # close existing pool and recreate with larger size
+            try:
+                pool.closeall()
+            except Exception:
+                pass
+            # reinitialize pool with larger max
+            init_postgres_pool(pool.minconn, new_max)
+            pool = PG_POOL
+            conn = pool.getconn()
+            return conn
+        log.error(f"Error getting connection from pool: {e}")
+        raise
+
+def release_postgres_connection(conn):
+    """
+    Return the connection back to the pool.
+    """
+    pool = init_postgres_pool()
+    try:
+        if conn.closed:
+            pool.putconn(conn, close=True)
+            log.debug("Closed dead connection from pool.")
+        else:
+            pool.putconn(conn)
+            log.debug("Released connection back to pool.")
+    except Exception as e:
+        log.error(f"Error releasing connection: {e}")
+
 def discover_lake():
     """
     Discover lake tables and return:
@@ -295,7 +415,7 @@ def discover_lake():
         )
         tables = [r[0] for r in cur.fetchall()]
         cur.close()
-        conn.close()
+        release_postgres_connection(conn)
 
         def load_table(t: str) -> pd.DataFrame:
             conn2 = connect_postgres()
@@ -555,8 +675,11 @@ def write_json_model_file(model_name, table_name, model_type, meta):
         log.info(f"[GEN] Generated/updated DBT JSON model for {model_name} (from lake table {table_name})")
 
 
-def generate_schema_yml(table_names, output_path="models/schema.yml"):
+def generate_schema_yml(table_names, output_path=None):
     table_names = list(table_names or [])
+
+    if output_path is None:
+        output_path = os.path.join(os.path.dirname(__file__), "models", "schema.yml")
 
     lines = []
     lines.append("version: 2")
@@ -570,7 +693,6 @@ def generate_schema_yml(table_names, output_path="models/schema.yml"):
         for t in table_names:
             lines.append(f"      - name: {t}")
     else:
-        # Critical: do NOT emit "tables:" with no items (YAML => null).
         lines.append("    tables: []")
 
     write_text_if_changed(output_path, "\n".join(lines) + "\n")
