@@ -2,12 +2,13 @@ import json
 import os
 import uuid
 from datetime import datetime
+import time
 
 import pandas as pd
 import psycopg2
 from logger import log
 from psycopg2 import sql
-from psycopg2.pool import SimpleConnectionPool
+from psycopg2.pool import ThreadedConnectionPool, PoolError
 
 from config import (
     LAKE_TYPE,
@@ -18,13 +19,11 @@ from config import (
     METASTORE_DB,
     METASTORE_DB_USER,
     METASTORE_DB_PASSWORD,
-    METASTORE_DB_SCHEMA,
+    METASTORE_DB_SCHEMA, POSTGRES_POOL_MIN, POSTGRES_POOL_MAX,
 )
 
 # Global connection pool for the metastore
 METASTORE_POOL = None
-METASTORE_POOL_MIN = int(os.getenv("METASTORE_POOL_MIN", 1))
-METASTORE_POOL_MAX = int(os.getenv("METASTORE_POOL_MAX", 5))
 
 
 def _append_parquet(row, path):
@@ -83,15 +82,17 @@ def _ensure_metastore_db():
 def init_metastore_pool(minconn=None, maxconn=None):
     """Initialize the connection pool for the metastore."""
     global METASTORE_POOL
+
     if minconn is None:
-        minconn = METASTORE_POOL_MIN
+        minconn = POSTGRES_POOL_MIN
     if maxconn is None:
-        maxconn = METASTORE_POOL_MAX
+        maxconn = POSTGRES_POOL_MAX
 
     if METASTORE_POOL is None:
         _ensure_metastore_db()
         try:
-            METASTORE_POOL = SimpleConnectionPool(
+            # IMPORTANT: Thread-safe pool for a multi-threaded service.
+            METASTORE_POOL = ThreadedConnectionPool(
                 minconn,
                 maxconn,
                 host=METASTORE_DB_HOST,
@@ -100,58 +101,97 @@ def init_metastore_pool(minconn=None, maxconn=None):
                 user=METASTORE_DB_USER,
                 password=METASTORE_DB_PASSWORD,
             )
-            log.info(
-                f"Metastore connection pool created (min={minconn}, max={maxconn})."
-            )
+            log.info(f"Metastore connection pool created (min={minconn}, max={maxconn}).")
         except Exception as e:
             log.error(f"Error establishing metastore connection pool: {e}")
             raise
     else:
         log.debug("Reusing existing metastore connection pool.")
+
     return METASTORE_POOL
 
 
 def get_metastore_connection():
-    """Get a connection from the metastore pool."""
+    """
+    Get a connection from the metastore pool.
+
+    Real fix:
+    - Never call closeall() on pool exhaustion (it breaks in-flight users).
+    - Wait for a released connection up to a bounded timeout.
+    - Use ThreadedConnectionPool for thread-safety.
+    """
     pool = init_metastore_pool()
-    try:
-        conn = pool.getconn()
-        if conn.closed:
-            log.warning("Received closed connection from pool; replacing it.")
-            pool.putconn(conn, close=True)
+
+    acquire_timeout_s = float(os.getenv("METASTORE_POOL_ACQUIRE_TIMEOUT_S", "60"))
+    retry_sleep_s = float(os.getenv("METASTORE_POOL_ACQUIRE_RETRY_S", "0.2"))
+    deadline = time.time() + acquire_timeout_s
+
+    last_err = None
+    while time.time() < deadline:
+        try:
             conn = pool.getconn()
-        log.debug("Acquired connection from metastore pool.")
-        return conn
-    except Exception as e:
-        msg = str(e)
-        if "connection pool exhausted" in msg.lower():
-            new_max = pool.maxconn + 5
-            log.warning(
-                f"Metastore connection pool exhausted. Expanding pool to {new_max}."
-            )
-            try:
-                pool.closeall()
-            except Exception:
-                pass
-            init_metastore_pool(pool.minconn, new_max)
-            pool = METASTORE_POOL
-            return pool.getconn()
-        log.error(f"Error getting metastore connection: {e}")
-        raise
+            if conn is None:
+                raise RuntimeError("Metastore pool returned None connection")
+
+            # Replace dead connections immediately.
+            if getattr(conn, "closed", 0):
+                log.warning("Received closed connection from pool; replacing it.")
+                try:
+                    pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+                continue
+
+            log.debug("Acquired connection from metastore pool.")
+            return conn
+
+        except PoolError as e:
+            last_err = e
+            # Typical message: "connection pool exhausted"
+            time.sleep(retry_sleep_s)
+            continue
+
+        except Exception as e:
+            log.error(f"Error getting metastore connection: {e}")
+            raise
+
+    # Timed out waiting for a free connection.
+    log.error(
+        "Metastore connection acquisition timed out after "
+        f"{acquire_timeout_s:.1f}s (min={pool.minconn}, max={pool.maxconn}). "
+        "Increase METASTORE_POOL_MAX or reduce concurrency."
+    )
+    if last_err is not None:
+        raise last_err
+    raise TimeoutError("Timed out acquiring metastore connection")
 
 
 def release_metastore_connection(conn):
     """Return a connection back to the metastore pool."""
+    if conn is None:
+        return
+
     pool = init_metastore_pool()
     try:
-        if conn.closed:
+        if getattr(conn, "closed", 0):
             pool.putconn(conn, close=True)
             log.debug("Closed dead metastore connection from pool.")
         else:
             pool.putconn(conn)
             log.debug("Released metastore connection back to pool.")
+    except PoolError as e:
+        # If someone ever closed the pool unexpectedly, don't crash the service.
+        log.error(f"Metastore pool error while releasing connection: {e}. Closing connection.")
+        try:
+            conn.close()
+        except Exception:
+            pass
     except Exception as e:
         log.error(f"Error releasing metastore connection: {e}")
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _append_db(data, table):
