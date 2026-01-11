@@ -50,3 +50,6 @@ control/
 
 
 docker run -d --name dozzle -p 6060:8080 -v /var/run/docker.sock:/var/run/docker.sock amir20/dozzle
+.e2e/
+/models/
+/README.md
