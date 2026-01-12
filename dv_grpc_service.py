@@ -27,7 +27,32 @@ from main import (
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+def _is_transient_dbt_failure(msg: str) -> bool:
+    m = (msg or "").lower()
 
+    # Typical "eventual consistency" errors: bronze table not created yet, schema not applied yet,
+    # Spark metastore not updated yet, temporary connectivity issues.
+    transient_markers = [
+        "[dbt]",
+        "dbt run failed",
+        "table or view not found",
+        "table_or_view_not_found",
+        "unresolved_relation",
+        "unresolved_column",
+        "analysisexception",
+        "no such table",
+        "does not exist",
+        "not found",
+        "path does not exist",
+        "metadatachangedexception",
+        "concurrentmodificationexception",
+        "timeout",
+        "timed out",
+        "connection refused",
+        "temporarily unavailable",
+        "dbt failed"
+    ]
+    return any(x in m for x in transient_markers)
 
 def _make_evidence_id(operation: pb.Operation) -> str:
     target = operation.target or "unknown"
@@ -109,6 +134,15 @@ def _discover_and_split(table_name: str) -> Tuple[Dict[str, Any], List[Dict[str,
     hubs, links, sats = split_datavault(table_name, meta)
     return meta, hubs, links, sats
 
+def _is_transient_discovery_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    # “lake table not present yet” / “introspection raced ingestion”
+    if "not found in lake tables" in s:
+        return True
+    # RDBMS introspection races can also surface like this in some paths
+    if "relation" in s and "does not exist" in s:
+        return True
+    return False
 
 # ---------------------------------------------------------------------------
 # Satellite evolution helpers
@@ -267,10 +301,17 @@ def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
         error_code = ""
         error_message = ""
     except Exception as exc:
-        log.critical(f"[GRPC_SERVICE] Error applying ADD_COLUMN in vault for table {table_name}: {exc}")
-        status = pb.OPERATION_STATUS_PERMANENT_ERROR
-        error_code = "VAULT_ADD_COLUMN_FAILED"
-        error_message = str(exc)
+        msg = str(exc)
+        log.critical(f"[GRPC_SERVICE] Error applying ADD_COLUMN in vault for table {table_name}: {msg}")
+
+        if _is_transient_dbt_failure(msg):
+            status = pb.OPERATION_STATUS_TRANSIENT_ERROR
+            error_code = "VAULT_ADD_COLUMN_TRANSIENT"
+        else:
+            status = pb.OPERATION_STATUS_PERMANENT_ERROR
+            error_code = "VAULT_ADD_COLUMN_FAILED"
+
+        error_message = msg
 
     return pb.OperationResult(
         correlation_id=operation.correlation_id,
@@ -308,12 +349,20 @@ def _handle_new_hub_for_vault(operation: pb.Operation) -> pb.OperationResult:
         meta, hubs, links, sats = _discover_and_split(table_name)
     except Exception as exc:
         msg = f"[GRPC_SERVICE] Failed to discover DV metadata for table {table_name!r}: {exc}"
-        log.critical(msg)
+        transient = _is_transient_discovery_error(exc)
+
+        if transient:
+            log.warning(msg)
+            status = pb.OPERATION_STATUS_TRANSIENT_ERROR
+        else:
+            log.critical(msg)
+            status = pb.OPERATION_STATUS_PERMANENT_ERROR
+
         return pb.OperationResult(
             correlation_id=operation.correlation_id,
             plan_id=operation.plan_id,
             idempotency_key=operation.idempotency_key,
-            status=pb.OPERATION_STATUS_PERMANENT_ERROR,
+            status=status,
             error_code="DV_DISCOVERY_FAILED",
             error_message=msg,
         )
@@ -403,10 +452,17 @@ def _handle_new_hub_for_vault(operation: pb.Operation) -> pb.OperationResult:
         error_code = ""
         error_message = ""
     except Exception as exc:
+        msg = str(exc)
         log.critical(f"[GRPC_SERVICE] Error applying NEW_HUB in vault for table {table_name}: {exc}")
-        status = pb.OPERATION_STATUS_PERMANENT_ERROR
-        error_code = "VAULT_NEW_HUB_FAILED"
-        error_message = str(exc)
+
+        if _is_transient_dbt_failure(msg):
+            status = pb.OPERATION_STATUS_TRANSIENT_ERROR
+            error_code = "VAULT_NEW_HUB_FAILED_TRANSIENT"
+        else:
+            status = pb.OPERATION_STATUS_PERMANENT_ERROR
+            error_code = "VAULT_NEW_HUB_FAILED_PERMANENT"
+
+        error_message = msg
 
     return pb.OperationResult(
         correlation_id=operation.correlation_id,
@@ -448,12 +504,20 @@ def _handle_new_link_for_vault(operation: pb.Operation) -> pb.OperationResult:
         meta, hubs, links, sats = _discover_and_split(table_name)
     except Exception as exc:
         msg = f"[GRPC_SERVICE] Failed to discover DV metadata for table {table_name!r}: {exc}"
-        log.critical(msg)
+        transient = _is_transient_discovery_error(exc)
+
+        if transient:
+            log.warning(msg)
+            status = pb.OPERATION_STATUS_TRANSIENT_ERROR
+        else:
+            log.critical(msg)
+            status = pb.OPERATION_STATUS_PERMANENT_ERROR
+
         return pb.OperationResult(
             correlation_id=operation.correlation_id,
             plan_id=operation.plan_id,
             idempotency_key=operation.idempotency_key,
-            status=pb.OPERATION_STATUS_PERMANENT_ERROR,
+            status=status,
             error_code="DV_DISCOVERY_FAILED",
             error_message=msg,
         )
@@ -541,11 +605,15 @@ def _handle_new_link_for_vault(operation: pb.Operation) -> pb.OperationResult:
         error_code = ""
         error_message = ""
     except Exception as exc:
+        msg = str(exc)
         log.critical(f"[GRPC_SERVICE] Error applying NEW_LINK in vault for table {table_name}: {exc}")
-        status = pb.OPERATION_STATUS_PERMANENT_ERROR
-        error_code = "VAULT_NEW_LINK_FAILED"
-        error_message = str(exc)
 
+        if _is_transient_dbt_failure(msg):
+            status = pb.OPERATION_STATUS_TRANSIENT_ERROR
+            error_code = "VAULT_NEW_LINK_TRANSIENT"
+        else:
+            status = pb.OPERATION_STATUS_PERMANENT_ERROR
+            error_code = "VAULT_NEW_LINK_FAILED_PERMANENT"
     return pb.OperationResult(
         correlation_id=operation.correlation_id,
         plan_id=operation.plan_id,
@@ -829,38 +897,77 @@ class VaultHandlerService(pb_grpc.VaultHandlerServicer):
 
             log.info(
                 f"[GRPC_SERVICE] VaultHandler.ApplyOperations: plan_id={op.plan_id} correlation_id="
-                f"{op.correlation_id} layer={layer_name} target={op.target} kind={kind_name} params={dict(op.params)}")
+                f"{op.correlation_id} layer={layer_name} target={op.target} kind={kind_name} params={dict(op.params)}"
+            )
 
-            if op.layer != pb.LAYER_VAULT:
+            try:
+                if op.layer != pb.LAYER_VAULT:
+                    result = pb.OperationResult(
+                        correlation_id=op.correlation_id,
+                        plan_id=op.plan_id,
+                        idempotency_key=op.idempotency_key,
+                        status=pb.OPERATION_STATUS_ALREADY_APPLIED,
+                        error_code="WRONG_LAYER",
+                        error_message=f"Operation layer {layer_name} not handled by VaultHandler",
+                    )
+                elif op.kind == pb.OPERATION_ADD_COLUMN:
+                    result = _handle_add_column_for_vault(op)
+                elif op.kind == pb.OPERATION_NEW_HUB:
+                    result = _handle_new_hub_for_vault(op)
+                elif op.kind == pb.OPERATION_NEW_LINK:
+                    result = _handle_new_link_for_vault(op)
+                elif op.kind == pb.OPERATION_CHANGE_TYPE:
+                    result = _handle_change_type_for_vault(op)
+                elif op.kind == pb.OPERATION_DROP_COLUMN:
+                    result = _handle_drop_column_for_vault(op)
+                else:
+                    msg = f"[GRPC_SERVICE] Operation kind {kind_name} not supported by VaultHandler"
+                    log.error(msg)
+                    result = pb.OperationResult(
+                        correlation_id=op.correlation_id,
+                        plan_id=op.plan_id,
+                        idempotency_key=op.idempotency_key,
+                        status=pb.OPERATION_STATUS_PERMANENT_ERROR,
+                        error_code="UNSUPPORTED_OPERATION",
+                        error_message=msg,
+                    )
+
+            except Exception as exc:
+                # IMPORTANT: never let exceptions escape the gRPC handler, otherwise
+                # SEF sees StatusCode.UNKNOWN/UNAVAILABLE and cannot distinguish transient
+                # dependency issues from permanent failures.
+                msg = f"[GRPC_SERVICE] Exception calling application: {exc}"
+                log.exception(msg)
+
+                # Mark as transient: SEF should retry.
                 result = pb.OperationResult(
                     correlation_id=op.correlation_id,
                     plan_id=op.plan_id,
                     idempotency_key=op.idempotency_key,
-                    status=pb.OPERATION_STATUS_ALREADY_APPLIED,
-                    error_code="WRONG_LAYER",
-                    error_message=f"Operation layer {layer_name} not handled by VaultHandler",
-                )
-            elif op.kind == pb.OPERATION_ADD_COLUMN:
-                result = _handle_add_column_for_vault(op)
-            elif op.kind == pb.OPERATION_NEW_HUB:
-                result = _handle_new_hub_for_vault(op)
-            elif op.kind == pb.OPERATION_NEW_LINK:
-                result = _handle_new_link_for_vault(op)
-            elif op.kind == pb.OPERATION_CHANGE_TYPE:
-                result = _handle_change_type_for_vault(op)
-            elif op.kind == pb.OPERATION_DROP_COLUMN:
-                result = _handle_drop_column_for_vault(op)
-            else:
-                msg = f"[GRPC_SERVICE] Operation kind {kind_name} not supported by VaultHandler"
-                log.error(msg)
-                result = pb.OperationResult(
-                    correlation_id=op.correlation_id,
-                    plan_id=op.plan_id,
-                    idempotency_key=op.idempotency_key,
-                    status=pb.OPERATION_STATUS_PERMANENT_ERROR,
-                    error_code="UNSUPPORTED_OPERATION",
+                    status=pb.OPERATION_STATUS_TRANSIENT_ERROR,
+                    error_code="DV_TRANSIENT_ERROR",
                     error_message=msg,
+                    evidence_snapshot_id=_make_evidence_id(op),
                 )
+
+                # Best-effort: record the failure as metadata (do not raise on failure)
+                try:
+                    write_metadata(
+                        {
+                            "layer": "vault",
+                            "target": op.target,
+                            "plan_id": op.plan_id,
+                            "correlation_id": op.correlation_id,
+                            "idempotency_key": op.idempotency_key,
+                            "operation_kind": kind_name,
+                            "params": dict(op.params),
+                            "evidence_id": result.evidence_snapshot_id,
+                            "source": "vault_handler_grpc",
+                            "note": f"transient_error: {exc}",
+                        }
+                    )
+                except Exception:
+                    pass
 
             results.append(result)
 

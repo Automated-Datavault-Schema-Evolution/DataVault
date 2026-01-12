@@ -26,7 +26,7 @@ from config import (
     DBT_DEBOUNCE_SECONDS, DBT_MAX_MODELS_PER_RUN, STREAM_TRIGGER, POSTGRES_POOL_MAX, POSTGRES_POOL_MIN)
 from dv_modeller import extract_metadata, split_datavault
 from meta_store import write_lineage, write_metadata
-from utils.bronze_ingestor import ensure_bronze_table_exists, start_bronze_writer
+from utils.bronze_ingestor import ensure_bronze_table_exists, start_bronze_writer, ensure_bronze_table_schema
 from utils.helper_service_ready import wait_for_lake, wait_for_kafka, wait_for_kafka_increase
 from utils.helper_spark import get_spark_session, ensure_spark_warehouse_dir, get_active_stream_query_by_name
 from utils.maintenance.helper_maintenance import maintenance_watchdog
@@ -40,6 +40,8 @@ from typing import Iterable, Set
 _DBT_LOCK = threading.Lock()  # serialize dbt runs during streaming
 PG_POOL = None
 
+_SPARK = None
+_SPARK_READY = threading.Event()
 # ----------- global runtime for graceful shutdown -------------------
 RUN = SimpleNamespace(stop_event=None, query=None, cdc_thread=None)
 
@@ -52,6 +54,16 @@ _DBT_WORKER_STOP = threading.Event()
 # gRPC server threading primitives
 VAULT_GRPC_STOP_EVENT = threading.Event()
 VAULT_GRPC_THREAD: threading.Thread | None = None
+
+def set_global_spark(spark):
+    global _SPARK
+    _SPARK = spark
+    _SPARK_READY.set()
+
+def get_global_spark(timeout_s=30):
+    if not _SPARK_READY.wait(timeout_s):
+        return None
+    return _SPARK
 
 def _graceful_shutdown(signum=None, frame=None):
     """Handle SIGTERM/SIGINT and atexit: stop CDC + drain/stop Spark cleanly."""
@@ -147,6 +159,40 @@ def write_text_if_changed(path: str, content: str) -> bool:
         f.write(content)
     return True
 
+def _preflight_bronze_for_tables(tables: Iterable[str]) -> None:
+    """
+    Ensure bronze.<table> exists and has at least the columns expected from the lake schema.
+
+    This is required for gRPC-triggered dbt runs where schema evolution may occur before
+    any CDC payload contains the new column (e.g., email).
+    """
+    if not tables:
+        return
+
+    try:
+        spark = get_spark_session("DataVault_DBT_Preflight")
+    except Exception as e:
+        log.warning(f"[DBT] Spark not available for bronze preflight: {e}")
+        return
+
+    from pyspark.sql.types import StructType, StructField, StringType
+
+    for t in tables:
+        tbl = str(t or "").strip().lower()
+        if not tbl:
+            continue
+        try:
+            cols = bronze_target_columns(spark, tbl) or []
+            if not cols:
+                # Lake not ready / table not discoverable yet; skip preflight for this table.
+                continue
+            schema = StructType([StructField(str(c), StringType(), True) for c in cols])
+
+            # Ensure table is registered as external Delta and enforce missing cols.
+            ensure_bronze_table_exists(spark, tbl, schema)
+            ensure_bronze_table_schema(spark, tbl, schema)
+        except Exception as e:
+            log.warning(f"[DBT] Bronze preflight failed for {tbl}: {e}")
 
 def run_dbt_models(models):
     """Run dbt for the specified models."""
@@ -155,8 +201,6 @@ def run_dbt_models(models):
 
     ensure_profiles_dir()
 
-    # --- Ensure dbt sources include any lake tables referenced by these models ---
-    # We infer the lake table name from each model's JSON metadata.
     schema_path = os.path.join(os.path.dirname(__file__), "models", "schema.yml")
 
     referenced_tables = set()
@@ -169,12 +213,17 @@ def run_dbt_models(models):
             if t:
                 referenced_tables.add(t)
         except FileNotFoundError:
-            # Model might exist as SQL only; ignore.
             continue
         except Exception as e:
             log.warning(f"[DBT] Could not read model metadata for {m}: {e}")
 
-    # Merge with any existing schema.yml tables (so we don't thrash the file)
+    # Normalize table ids to match how bronze is actually named/registered
+    referenced_tables = {str(t).strip().lower() for t in referenced_tables if str(t).strip()}
+
+    # NEW: Ensure bronze sources exist + have the expected columns before dbt reads them
+    _preflight_bronze_for_tables(sorted(referenced_tables))
+
+    # Merge with existing schema.yml tables (avoid thrash)
     existing_tables = set()
     try:
         if os.path.exists(schema_path):
@@ -184,7 +233,7 @@ def run_dbt_models(models):
                 if (src.get("name") == "staging") and isinstance(src.get("tables"), list):
                     for t in src["tables"]:
                         if isinstance(t, dict) and t.get("name"):
-                            existing_tables.add(str(t["name"]))
+                            existing_tables.add(str(t["name"]).strip().lower())
     except Exception as e:
         log.warning(f"[DBT] Could not parse existing schema.yml (will regenerate): {e}")
 
@@ -201,9 +250,15 @@ def run_dbt_models(models):
 
     log.info(f"[DBT] Running: {cmd}")
 
-    # use check=False to keep app running even if some models fail
     with _DBT_LOCK:
-        subprocess.run(cmd, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.stdout:
+            log.info(proc.stdout)
+        if proc.stderr:
+            log.error(proc.stderr)
+
+        if proc.returncode != 0:
+            raise RuntimeError(f"dbt failed (rc={proc.returncode})")
 
 def queue_dbt_models(models: Iterable[str]) -> None:
     """Collect models to run; actual run is done by the debouncer thread."""
@@ -582,7 +637,7 @@ def write_sql_model_file(model_name, table_name, model_type, meta):
 
     business_keys = list(meta.get("business_keys", []))
     attributes = list(meta.get("attributes", []))
-
+    attrs = [a for a in attributes if a not in business_keys]
     src_name = meta.get("source_name") or "staging"
 
     # --- config block: literal unique_key + merge ---------------------------
@@ -612,21 +667,28 @@ def write_sql_model_file(model_name, table_name, model_type, meta):
             lines.append("    " + k + ",")
         lines.append("    current_timestamp() as load_datetime,")
         lines.append("    '" + table_name + "' as record_source")
-        lines.append("from " + jinja_source(src_name, table_name))
+        src_tbl = str(table_name).lower()
+        lines.append("from " + jinja_source(src_name, src_tbl))
         lines.append("group by " + ", ".join(business_keys))
 
     else:  # sat
         # keys + attributes + hashdiff + audit
-        for c in business_keys + attributes:
-            lines.append("    " + c + ",")
-        if attributes:
-            attrs_expr = ", ".join("coalesce(cast(" + c + " as string), '')" for c in attributes)
+        select_cols = []
+        for c in business_keys + attrs:
+            if c not in select_cols:
+                select_cols.append(c)
+        for c in select_cols:
+            lines.append(f"    {c},")
+        # IMPORTANT: hashdiff should use attrs (attributes excluding business keys)
+        if attrs:
+            attrs_expr = ", ".join("coalesce(cast(" + c + " as string), '')" for c in attrs)
             lines.append("    sha2(concat_ws('||', " + attrs_expr + "), 256) as hashdiff,")
         else:
             lines.append("    sha2('', 256) as hashdiff,")
         lines.append("    current_timestamp() as load_datetime,")
         lines.append("    '" + table_name + "' as record_source")
-        lines.append("from " + jinja_source(src_name, table_name))
+        src_tbl = str(table_name).lower()
+        lines.append("from " + jinja_source(src_name, src_tbl))
 
     content = "\n".join(lines) + "\n"
     wrote = write_text_if_changed(file_path, content)
@@ -648,13 +710,28 @@ def write_json_model_file(model_name, table_name, model_type, meta):
     elif mtype not in {"hub", "link"}:
         raise ValueError(f"Unsupported model_type: {model_type!r}")
 
+    bks = list(meta.get("business_keys", []))
+
+    attrs_raw = list(meta.get("attributes", []))
+    attrs = []
+    for a in attrs_raw:
+        if a not in bks and a not in attrs:
+            attrs.append(a)
+
+    cols_raw = list(meta.get("columns", []))
+    cols = []
+    for c in cols_raw:
+        if c not in cols:
+            cols.append(c)
+
+
     model_def = {
         "model_name": model_name,
         "table_name": table_name,
         "model_type": mtype,
-        "business_keys": list(meta.get("business_keys", [])),
-        "attributes": list(meta.get("attributes", [])),
-        "columns": list(meta.get("columns", [])),
+        "business_keys": bks,
+        "attributes": attrs,
+        "columns": cols,
     }
 
     json_txt = json.dumps(model_def, indent=2) + "\n"
@@ -691,7 +768,7 @@ def generate_schema_yml(table_names, output_path=None):
     if table_names:
         lines.append("    tables:")
         for t in table_names:
-            lines.append(f"      - name: {t}")
+            lines.append(f"      - name: {str(t).lower()}")
     else:
         lines.append("    tables: []")
 
