@@ -159,6 +159,50 @@ def write_text_if_changed(path: str, content: str) -> bool:
         f.write(content)
     return True
 
+def _wait_bronze_stable_rows(
+    spark,
+    schema: str,
+    table: str,
+    *,
+    min_rows: int = 1,
+    stable_checks: int = 2,
+    interval_s: float = 2.0,
+    timeout_s: float = 120.0,
+) -> int:
+    """
+    Wait until SELECT COUNT(*) from schema.table is:
+      - >= min_rows
+      - stable across `stable_checks` consecutive polls
+
+    This prevents dbt raw-vault runs from snapshotting bronze while ingestion is still in progress.
+    """
+    import time
+
+    deadline = time.time() + float(timeout_s)
+    last = None
+    stable = 0
+
+    while time.time() < deadline:
+        try:
+            cnt = spark.sql(f"SELECT COUNT(*) AS c FROM {schema}.{table}").collect()[0]["c"]
+            cnt = int(cnt)
+        except Exception:
+            cnt = 0
+
+        if cnt >= min_rows:
+            if last is not None and cnt == last:
+                stable += 1
+            else:
+                stable = 0
+            last = cnt
+
+            if stable >= (stable_checks - 1):
+                return cnt
+
+        time.sleep(float(interval_s))
+
+    return int(last or 0)
+
 def _preflight_bronze_for_tables(tables: Iterable[str]) -> None:
     """
     Ensure bronze.<table> exists and has at least the columns expected from the lake schema.
@@ -191,6 +235,20 @@ def _preflight_bronze_for_tables(tables: Iterable[str]) -> None:
             # Ensure table is registered as external Delta and enforce missing cols.
             ensure_bronze_table_exists(spark, tbl, schema)
             ensure_bronze_table_schema(spark, tbl, schema)
+            # Wait until bronze row count stabilizes (prevents empty/partial raw_vault tables).
+            try:
+                stable_cnt = _wait_bronze_stable_rows(
+                    spark,
+                    STAGING_SCHEMA if "STAGING_SCHEMA" in globals() else "bronze",
+                    tbl,
+                    min_rows=1,
+                    stable_checks=3,
+                    interval_s=2.0,
+                    timeout_s=180.0,
+                )
+                log.info(f"[DBT] Bronze preflight ready: {tbl} stable_rows={stable_cnt}")
+            except Exception as e:
+                log.warning(f"[DBT] Bronze row-count stability check failed for {tbl}: {e}")
         except Exception as e:
             log.warning(f"[DBT] Bronze preflight failed for {tbl}: {e}")
 
@@ -347,13 +405,44 @@ def stop_dbt_debouncer() -> None:
         t.join(timeout=15)
 
 def _resolve_thrift(target_cfg):
-    """Resolve Hive Thrift connection parameters with env taking precedence."""
+    """
+    Resolve Hive Thrift connection parameters with env taking precedence.
+
+    Drop-in hardening:
+      - Supports dbt-style jinja in profiles.yml (e.g. {{ env_var('USER', 'dbt') }})
+      - Allows explicit THRIFT_USER override
+      - Avoids usernames that do not exist in the container (defaults to 'root' for tests)
+    """
     env_host = os.environ.get("THRIFT_HOST")
     env_port = os.environ.get("THRIFT_PORT")
+    env_user = os.environ.get("THRIFT_USER")
+
     host = env_host or target_cfg.get("host") or THRIFT_HOST
-    port = int(env_port or target_cfg.get("port") or THRIFT_PORT)
-    user = target_cfg.get("user")
-    log.debug(f"Using Hive Thrift server host={host}, port={port}")
+    port_raw = env_port or target_cfg.get("port") or THRIFT_PORT
+    user = env_user or target_cfg.get("user") or os.environ.get("USER") or "root"
+
+    # Render jinja templates if present (dbt profiles often contain {{ env_var(...) }}).
+    # We only render the env_var(...) pattern, which is what your config uses.
+    if isinstance(host, str) and "{{" in host:
+        host = Template(host).render(env_var=lambda name, default=None: os.getenv(name, default))
+
+    if isinstance(port_raw, str) and "{{" in port_raw:
+        port_raw = Template(port_raw).render(env_var=lambda name, default=None: os.getenv(name, default))
+
+    if isinstance(user, str) and "{{" in user:
+        user = Template(user).render(env_var=lambda name, default=None: os.getenv(name, default))
+
+    # Normalize
+    host = str(host).strip()
+    user = str(user).strip()
+    port = int(str(port_raw).strip())
+
+    # Spark/Hadoop group mapping will error if the user does not exist in the container.
+    # For docker-compose based tests, safest is root unless explicitly overridden.
+    if not user or user == "dbt" or user == "{{ env_var('USER', 'dbt') }}":
+        user = "root"
+
+    log.debug(f"Using Hive Thrift server host={host}, port={port}, user={user}")
     return host, port, user
 
 
