@@ -21,12 +21,25 @@ from main import (
     discover_lake,
     write_json_model_file,
     run_dbt_models,
+    queue_dbt_models,
+    start_dbt_debouncer,
 )
 
 
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+def _default_business_keys(table_name: str, models_for_table: List[Dict[str, Any]]) -> List[str]:
+    """
+    Best-effort business key selection.
+    Prefer existing model keys; fallback to ['id'] which matches all E2E datasets.
+    """
+    for m in models_for_table:
+        bks = list(m.get("business_keys") or [])
+        if bks:
+            return bks
+    return ["id"]
+
 def _is_transient_dbt_failure(msg: str) -> bool:
     m = (msg or "").lower()
 
@@ -195,9 +208,12 @@ def _ensure_satellite_for_table(
 
 def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
     """
-    Extend an existing satellite for a table by adding a new attribute column.
+    Add an attribute column to the satellite structure for a table.
 
-    This is the "regular" evolution path for new descriptive columns.
+    Minimal + robust behavior:
+      - Do NOT require lake discovery to build a sat template.
+      - Use existing sat models if present, otherwise create sat_<table>.
+      - Queue dbt asynchronously (do not block gRPC).
     """
     params = dict(operation.params)
     column_name = params.get("column_name")
@@ -222,67 +238,62 @@ def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
             error_message="target (table_name) is required for OPERATION_ADD_COLUMN",
         )
 
-    # The "default" satellite for this table is sat_<table_base>;
-    # we evolve that by appending the new column as an attribute.
-    meta, hubs, links, sats = _discover_and_split(table_name)
-
-    if not sats:
-        msg = f"[GRPC_SERVICE] No satellite template available for table {table_name!r}; cannot apply ADD_COLUMN in vault"
-        log.error(msg)
-        return pb.OperationResult(
-            correlation_id=operation.correlation_id,
-            plan_id=operation.plan_id,
-            idempotency_key=operation.idempotency_key,
-            status=pb.OPERATION_STATUS_PERMANENT_ERROR,
-            error_code="NO_SAT_TEMPLATE",
-            error_message=msg,
-        )
-
-    sat_template = sats[0]
-    attributes = list(sat_template.get("attributes") or [])
-    if column_name in attributes:
-        # Already present -> idempotent no-op
-        evidence_id = _make_evidence_id(operation)
-        try:
-            write_metadata(
-                {
-                    "layer": "vault",
-                    "target": sat_template["name"],
-                    "plan_id": operation.plan_id,
-                    "correlation_id": operation.correlation_id,
-                    "idempotency_key": operation.idempotency_key,
-                    "operation_kind": "ADD_COLUMN",
-                    "params": params,
-                    "evidence_id": evidence_id,
-                    "source": "vault_handler_grpc",
-                    "note": "no-op; column already present",
-                }
-            )
-        except Exception as exc:
-            log.critical(f"[GRPC_SERVICE] Failed to write metadata for ALREADY_APPLIED op: {exc}")
-
-        return pb.OperationResult(
-            correlation_id=operation.correlation_id,
-            plan_id=operation.plan_id,
-            idempotency_key=operation.idempotency_key,
-            status=pb.OPERATION_STATUS_ALREADY_APPLIED,
-            error_code="",
-            error_message="",
-            evidence_snapshot_id=evidence_id,
-        )
-
-    # Add to attributes and regenerate model
-    attributes.append(column_name)
-    sat_template["attributes"] = attributes
-
     models_for_table = _load_models_for_table(table_name)
-    created_models, _ = _ensure_satellite_for_table(table_name, sat_template, models_for_table)
+    existing_sats = _models_by_type(models_for_table, "sat")
+
+    bks = _default_business_keys(table_name, models_for_table)
+
+    # If any existing satellite already has this column as attribute -> idempotent no-op
+    for s in existing_sats:
+        if column_name in (s.get("attributes") or []):
+            evidence_id = _make_evidence_id(operation)
+            try:
+                write_metadata(
+                    {
+                        "layer": "vault",
+                        "target": s.get("model_name") or table_name,
+                        "plan_id": operation.plan_id,
+                        "correlation_id": operation.correlation_id,
+                        "idempotency_key": operation.idempotency_key,
+                        "operation_kind": "ADD_COLUMN",
+                        "params": params,
+                        "evidence_id": evidence_id,
+                        "source": "vault_handler_grpc",
+                        "note": "no-op; column already present",
+                    }
+                )
+            except Exception as exc:
+                log.critical(f"[GRPC_SERVICE] Failed to write metadata for ALREADY_APPLIED op: {exc}")
+
+            return pb.OperationResult(
+                correlation_id=operation.correlation_id,
+                plan_id=operation.plan_id,
+                idempotency_key=operation.idempotency_key,
+                status=pb.OPERATION_STATUS_ALREADY_APPLIED,
+                error_code="",
+                error_message="",
+                evidence_snapshot_id=evidence_id,
+            )
+
+    # Build a sat template using existing sat (if any) or a new base sat
+    base_attrs: List[str] = []
+    if existing_sats:
+        base_attrs = list(existing_sats[0].get("attributes") or [])
+
+    # Attributes must not include business keys
+    if column_name not in bks and column_name not in base_attrs:
+        base_attrs.append(column_name)
+
+    sat_template = {"key": bks, "attributes": base_attrs, "name": f"sat_{table_name}"}
+
+    created_models, _already_present = _ensure_satellite_for_table(table_name, sat_template, models_for_table)
 
     evidence_id = _make_evidence_id(operation)
 
     try:
         if created_models:
-            run_dbt_models(created_models)
+            start_dbt_debouncer()
+            queue_dbt_models(created_models)
 
         write_metadata(
             {
@@ -295,11 +306,21 @@ def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
                 "params": params,
                 "evidence_id": evidence_id,
                 "source": "vault_handler_grpc",
+                "note": "created_models=" + ",".join(created_models) if created_models else "no-op",
             }
         )
-        status = pb.OPERATION_STATUS_OK
-        error_code = ""
-        error_message = ""
+
+        status = pb.OPERATION_STATUS_OK if created_models else pb.OPERATION_STATUS_ALREADY_APPLIED
+        return pb.OperationResult(
+            correlation_id=operation.correlation_id,
+            plan_id=operation.plan_id,
+            idempotency_key=operation.idempotency_key,
+            status=status,
+            error_code="",
+            error_message="",
+            evidence_snapshot_id=evidence_id,
+        )
+
     except Exception as exc:
         msg = str(exc)
         log.critical(f"[GRPC_SERVICE] Error applying ADD_COLUMN in vault for table {table_name}: {msg}")
@@ -311,28 +332,25 @@ def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
             status = pb.OPERATION_STATUS_PERMANENT_ERROR
             error_code = "VAULT_ADD_COLUMN_FAILED"
 
-        error_message = msg
-
-    return pb.OperationResult(
-        correlation_id=operation.correlation_id,
-        plan_id=operation.plan_id,
-        idempotency_key=operation.idempotency_key,
-        status=status,
-        error_code=error_code,
-        error_message=error_message,
-        evidence_snapshot_id=evidence_id,
-    )
+        return pb.OperationResult(
+            correlation_id=operation.correlation_id,
+            plan_id=operation.plan_id,
+            idempotency_key=operation.idempotency_key,
+            status=status,
+            error_code=error_code,
+            error_message=msg,
+            evidence_snapshot_id=evidence_id,
+        )
 
 
 def _handle_new_hub_for_vault(operation: pb.Operation) -> pb.OperationResult:
     """
-    Create a new hub for a table, *without* altering existing hubs.
+    Create/ensure hub + base satellite models for a lake table.
 
-    Scenarios:
-      - If no hub exists yet for the table -> create the base hub (hub_<base>).
-      - If a hub exists but the inferred business key set would change ->
-        create a *new* hub variant (hub_<base>_v2, v3, ...) instead of
-        changing the existing one. Then ensure a compatible satellite exists.
+    Minimal + robust behavior:
+      - Do NOT block on lake discovery (SEF can fire before lake ingest finishes).
+      - Create convention-based hub/sat JSON models if missing.
+      - Queue dbt work asynchronously (do not run synchronously in gRPC).
     """
     table_name = operation.target or dict(operation.params).get("table_name")
     if not table_name:
@@ -345,95 +363,40 @@ def _handle_new_hub_for_vault(operation: pb.Operation) -> pb.OperationResult:
             error_message="target (table_name) is required for OPERATION_NEW_HUB",
         )
 
-    try:
-        meta, hubs, links, sats = _discover_and_split(table_name)
-    except Exception as exc:
-        msg = f"[GRPC_SERVICE] Failed to discover DV metadata for table {table_name!r}: {exc}"
-        transient = _is_transient_discovery_error(exc)
+    models_for_table = _load_models_for_table(table_name)
+    existing_hubs = _models_by_type(models_for_table, "hub")
+    existing_sats = _models_by_type(models_for_table, "sat")
 
-        if transient:
-            log.warning(msg)
-            status = pb.OPERATION_STATUS_TRANSIENT_ERROR
-        else:
-            log.critical(msg)
-            status = pb.OPERATION_STATUS_PERMANENT_ERROR
+    hub_name = f"hub_{table_name}"
+    sat_base_name = f"sat_{table_name}"
 
-        return pb.OperationResult(
-            correlation_id=operation.correlation_id,
-            plan_id=operation.plan_id,
-            idempotency_key=operation.idempotency_key,
-            status=status,
-            error_code="DV_DISCOVERY_FAILED",
-            error_message=msg,
-        )
+    bks = _default_business_keys(table_name, models_for_table)
 
-    if not hubs:
-        msg = f"[GRPC_SERVICE] No hub candidate detected for table {table_name!r}; cannot create hub"
-        log.error(msg)
-        return pb.OperationResult(
-            correlation_id=operation.correlation_id,
-            plan_id=operation.plan_id,
-            idempotency_key=operation.idempotency_key,
-            status=pb.OPERATION_STATUS_PERMANENT_ERROR,
-            error_code="NO_HUB_CANDIDATE",
-            error_message=msg,
-        )
+    created_models: List[str] = []
 
-    hub_candidate = hubs[0]
-    hub_keys = list(hub_candidate.get("key") or [])
-    base_hub_name = hub_candidate.get("name") or f"hub_{table_name}"
+    # Ensure hub exists
+    if not any(m.get("model_name") == hub_name for m in existing_hubs):
+        meta_hub = {"business_keys": bks, "attributes": [], "columns": list(bks)}
+        write_json_model_file(hub_name, table_name, "hub", meta_hub)
+        created_models.append(hub_name)
 
-    models = _load_models_for_table(table_name)
-    existing_hubs = _models_by_type(models, "hub")
-
-    existing_names = [m["model_name"] for m in existing_hubs if "model_name" in m]
-
-    # Check if a hub with the same key set already exists
-    for h in existing_hubs:
-        bk = list(h.get("business_keys") or [])
-        if sorted(bk) == sorted(hub_keys):
-            # Already have a hub with this shape. We still want satellites to fit.
-            log.info(
-                f"[GRPC_SERVICE] Hub with same keyset already exists for table {table_name} (model=%s); no new hub created",
-                h.get("model_name"),
-            )
-            hub_model_name = h.get("model_name") or base_hub_name
-            break
-    else:
-        # Need a new hub: either first hub, or a side-by-side variant
-        hub_model_name = _next_versioned_name(base_hub_name, existing_names)
-        meta_hub = {
-            "business_keys": hub_keys,
-            "attributes": [],
-            "columns": hub_keys,
-        }
-        write_json_model_file(hub_model_name, table_name, "hub", meta_hub)
-        log.info(
-            f"[GRPC_SERVICE] Created new hub model {hub_model_name} for table {table_name} with business_keys={hub_keys}")
-
-    models = _load_models_for_table(table_name)  # refresh for satellites
-
-    # Ensure there is a compatible satellite that "accepts" this hub
-    if sats:
-        sat_template = sats[0]
-        created_models, already_present = _ensure_satellite_for_table(table_name, sat_template, models)
-    else:
-        created_models, already_present = [], True
+    # Ensure at least one satellite exists (base sat)
+    if not existing_sats:
+        meta_sat = {"business_keys": bks, "attributes": [], "columns": list(bks)}
+        write_json_model_file(sat_base_name, table_name, "sat", meta_sat)
+        created_models.append(sat_base_name)
 
     evidence_id = _make_evidence_id(operation)
 
     try:
         if created_models:
-            run_dbt_models([hub_model_name] + created_models)
-        else:
-            # Only hub might be new
-            if hub_model_name not in [m.get("model_name") for m in existing_hubs]:
-                run_dbt_models([hub_model_name])
+            start_dbt_debouncer()
+            queue_dbt_models(created_models)
 
         write_metadata(
             {
                 "layer": "vault",
-                "target": hub_model_name,
+                "target": table_name,
                 "plan_id": operation.plan_id,
                 "correlation_id": operation.correlation_id,
                 "idempotency_key": operation.idempotency_key,
@@ -441,38 +404,33 @@ def _handle_new_hub_for_vault(operation: pb.Operation) -> pb.OperationResult:
                 "params": dict(operation.params),
                 "evidence_id": evidence_id,
                 "source": "vault_handler_grpc",
+                "note": "created_models=" + ",".join(created_models) if created_models else "no-op",
             }
         )
 
-        status = (
-            pb.OPERATION_STATUS_ALREADY_APPLIED
-            if (hub_model_name in existing_names and already_present)
-            else pb.OPERATION_STATUS_OK
+        status = pb.OPERATION_STATUS_OK if created_models else pb.OPERATION_STATUS_ALREADY_APPLIED
+        return pb.OperationResult(
+            correlation_id=operation.correlation_id,
+            plan_id=operation.plan_id,
+            idempotency_key=operation.idempotency_key,
+            status=status,
+            error_code="",
+            error_message="",
+            evidence_snapshot_id=evidence_id,
         )
-        error_code = ""
-        error_message = ""
+
     except Exception as exc:
         msg = str(exc)
-        log.critical(f"[GRPC_SERVICE] Error applying NEW_HUB in vault for table {table_name}: {exc}")
-
-        if _is_transient_dbt_failure(msg):
-            status = pb.OPERATION_STATUS_TRANSIENT_ERROR
-            error_code = "VAULT_NEW_HUB_FAILED_TRANSIENT"
-        else:
-            status = pb.OPERATION_STATUS_PERMANENT_ERROR
-            error_code = "VAULT_NEW_HUB_FAILED_PERMANENT"
-
-        error_message = msg
-
-    return pb.OperationResult(
-        correlation_id=operation.correlation_id,
-        plan_id=operation.plan_id,
-        idempotency_key=operation.idempotency_key,
-        status=status,
-        error_code=error_code,
-        error_message=error_message,
-        evidence_snapshot_id=evidence_id,
-    )
+        log.critical(f"[GRPC_SERVICE] Error applying NEW_HUB in vault for table {table_name}: {msg}")
+        return pb.OperationResult(
+            correlation_id=operation.correlation_id,
+            plan_id=operation.plan_id,
+            idempotency_key=operation.idempotency_key,
+            status=pb.OPERATION_STATUS_TRANSIENT_ERROR,
+            error_code="VAULT_NEW_HUB_TRANSIENT",
+            error_message=msg,
+            evidence_snapshot_id=evidence_id,
+        )
 
 
 def _handle_new_link_for_vault(operation: pb.Operation) -> pb.OperationResult:
@@ -531,7 +489,7 @@ def _handle_new_link_for_vault(operation: pb.Operation) -> pb.OperationResult:
 
     if not candidates:
         msg = f"[GRPC_SERVICE] No link candidates found for table {table_name!r} (fk_filter={fk_filter!r})"
-        log.warnin(msg)
+        log.warning(msg)
         return pb.OperationResult(
             correlation_id=operation.correlation_id,
             plan_id=operation.plan_id,
@@ -585,7 +543,8 @@ def _handle_new_link_for_vault(operation: pb.Operation) -> pb.OperationResult:
 
     try:
         if created_models:
-            run_dbt_models(created_models)
+            start_dbt_debouncer()
+            queue_dbt_models(created_models)
 
         write_metadata(
             {
@@ -660,7 +619,7 @@ def _handle_change_type_for_vault(operation: pb.Operation) -> pb.OperationResult
         models = _load_models_for_table(table_name)
         model_names = [m.get("model_name") for m in models if m.get("model_name")]
         if model_names:
-            run_dbt_models(model_names)
+            queue_dbt_models(model_names)
 
         write_metadata(
             {
@@ -781,7 +740,8 @@ def _handle_drop_column_for_vault(operation: pb.Operation) -> pb.OperationResult
                 return link_res
 
         if created_models:
-            run_dbt_models(created_models)
+            start_dbt_debouncer()
+            queue_dbt_models(created_models)
 
         write_metadata(
             {

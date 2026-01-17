@@ -269,8 +269,14 @@ def produce_tables_once(tables):
     return produced_counts
 
 
-def cdc_producer_insert_only(stop_event=None):
+def cdc_producer_insert_only(stop_event=None, skip_full_load_tables=None):
     check_and_create_topic()
+
+    # If a table has no watermark yet, the default behavior is to treat the full table as "new".
+    # During service bootstrap we may intentionally postpone full-load for tables that are handled
+    # by the dedicated initial-load path (produce_tables_once). This avoids duplicate full loads
+    # while still allowing truly new tables (created after startup) to be CDC-produced immediately.
+    skip_full_load_tables = set(skip_full_load_tables or [])
 
     producer = KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -310,6 +316,12 @@ def cdc_producer_insert_only(stop_event=None):
                 df_ts = pd.to_datetime(df["ingestion_timestamp"], errors="coerce", utc=True)
                 new_rows = df[df_ts > last_ts]
             else:
+                # No watermark yet:
+                # - If this table is part of the startup baseline, let the explicit initial-load path
+                #   establish the first watermark.
+                # - Otherwise, this is a truly new table: produce full load now.
+                if table in skip_full_load_tables:
+                    continue
                 new_rows = df
 
             if new_rows.empty:

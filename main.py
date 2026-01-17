@@ -35,35 +35,215 @@ from utils.schema_helpers import bronze_target_columns, infer_schema_from_cdc_ev
 
 import threading
 import time
-from typing import Iterable, Set
+from typing import Iterable, Set, Optional
 
-_DBT_LOCK = threading.Lock()  # serialize dbt runs during streaming
 PG_POOL = None
+_PG_POOL_LOCK = threading.Lock()
 
 _SPARK = None
 _SPARK_READY = threading.Event()
 # ----------- global runtime for graceful shutdown -------------------
 RUN = SimpleNamespace(stop_event=None, query=None, cdc_thread=None)
 
-# Thread-safe set of pending dbt models to run
-_DBT_PENDING_MODELS: Set[str] = set()
-_DBT_PENDING_LOCK = threading.Lock()
-_DBT_WORKER_THREAD: threading.Thread | None = None
-_DBT_WORKER_STOP = threading.Event()
+_DBT_LOCK = threading.Lock()                 # serializes actual dbt subprocess runs
+_DBT_PENDING_LOCK = threading.Lock()         # protects pending set + persistence
+_DBT_WORKER_STOP = threading.Event()         # stop signal for worker
+_DBT_WAKE = threading.Event()                # wake signal when new models arrive
+_DBT_WORKER_THREAD: Optional[threading.Thread] = None
+
+_DBT_PENDING_MODELS: set[str] = set()
+_DBT_PENDING_LOADED = False
+
+# Persist pending models so a container restart (fault injection) does not lose queued work.
+_DBT_PENDING_FILE = os.getenv("DBT_PENDING_MODELS_FILE", "/data/state/dbt_pending_models.json")
+
+def _load_pending_models_from_disk() -> None:
+    """Load pending models once per process start (idempotent)."""
+    global _DBT_PENDING_LOADED, _DBT_PENDING_MODELS
+    if _DBT_PENDING_LOADED:
+        return
+    _DBT_PENDING_LOADED = True
+
+    try:
+        if not os.path.exists(_DBT_PENDING_FILE):
+            return
+        with open(_DBT_PENDING_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f) or []
+        if isinstance(data, list):
+            cleaned = {str(x).strip() for x in data if str(x).strip()}
+            _DBT_PENDING_MODELS |= cleaned
+    except Exception as exc:
+        log.warning(f"[DBT-DEBOUNCER] Failed to load pending models from {_DBT_PENDING_FILE}: {exc}")
+
+
+def _persist_pending_models_to_disk() -> None:
+    """Atomically persist pending models."""
+    try:
+        os.makedirs(os.path.dirname(_DBT_PENDING_FILE), exist_ok=True)
+        tmp = _DBT_PENDING_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(_DBT_PENDING_MODELS), f)
+        os.replace(tmp, _DBT_PENDING_FILE)
+    except Exception as exc:
+        log.warning(f"[DBT-DEBOUNCER] Failed to persist pending models to {_DBT_PENDING_FILE}: {exc}")
+
+
+def queue_dbt_models(models: Iterable[str]) -> None:
+    """
+    Collect models to run; actual run is done by the debouncer thread.
+    Key properties:
+      - Safe to call before the debouncer is started
+      - Wakes the debouncer immediately
+      - Persists pending set to survive restarts
+    """
+    models = [m for m in (models or []) if m and str(m).strip()]
+    if not models:
+        return
+
+    with _DBT_PENDING_LOCK:
+        _load_pending_models_from_disk()
+        before = len(_DBT_PENDING_MODELS)
+        _DBT_PENDING_MODELS.update(str(m).strip() for m in models)
+        if len(_DBT_PENDING_MODELS) != before:
+            _persist_pending_models_to_disk()
+
+    # Wake worker so it doesn't wait the full debounce interval.
+    _DBT_WAKE.set()
+
+
+def _drain_models(max_models: Optional[int] = None) -> list[str]:
+    """Atomically take up to max_models models from the pending set (and persist)."""
+    with _DBT_PENDING_LOCK:
+        _load_pending_models_from_disk()
+        if not _DBT_PENDING_MODELS:
+            return []
+
+        if max_models is None or max_models >= len(_DBT_PENDING_MODELS):
+            batch = sorted(_DBT_PENDING_MODELS)
+            _DBT_PENDING_MODELS.clear()
+            _persist_pending_models_to_disk()
+            return batch
+
+        batch = sorted(list(_DBT_PENDING_MODELS)[: max_models])
+        _DBT_PENDING_MODELS.difference_update(batch)
+        _persist_pending_models_to_disk()
+        return batch
+
+
+def _requeue(batch: list[str]) -> None:
+    """Re-queue a batch after a failed dbt run."""
+    if not batch:
+        return
+    with _DBT_PENDING_LOCK:
+        _load_pending_models_from_disk()
+        _DBT_PENDING_MODELS.update(batch)
+        _persist_pending_models_to_disk()
+    _DBT_WAKE.set()
+
+
+def _dbt_worker_loop(interval_seconds: int, max_models_per_run: int) -> None:
+    """
+    Background loop that runs dbt for accumulated models.
+    - Wake-on-queue for fast reaction
+    - Retry by re-queuing on failure
+    """
+    log.info(
+        "[DBT-DEBOUNCER] started: interval=%ss, max_models_per_run=%s",
+        interval_seconds, max_models_per_run
+    )
+
+    try:
+        while not _DBT_WORKER_STOP.is_set():
+            # Wait for either a wake signal or the periodic interval.
+            _DBT_WAKE.wait(timeout=float(interval_seconds))
+            _DBT_WAKE.clear()
+
+            if _DBT_WORKER_STOP.is_set():
+                break
+
+            batch = _drain_models(max_models_per_run)
+            if not batch:
+                continue
+
+            try:
+                log.info("[DBT-DEBOUNCER] running (size=%s): %s", len(batch), batch)
+                # run_dbt_models must exist in main.py already
+                run_dbt_models(batch)
+            except Exception as exc:
+                # Important: do not drop the batch; requeue for retry.
+                log.warning(f"[DBT-DEBOUNCER] dbt run failed; re-queueing batch. error={exc}")
+                _requeue(batch)
+                # backoff a bit to avoid tight loops on persistent failures
+                time.sleep(min(10.0, float(interval_seconds)))
+
+        # Drain on shutdown
+        final = _drain_models(None)
+        if final:
+            try:
+                log.info("[DBT-DEBOUNCER] draining on shutdown (size=%s): %s", len(final), final)
+                run_dbt_models(final)
+            except Exception as exc:
+                log.warning(f"[DBT-DEBOUNCER] final drain failed (dropping). error={exc}")
+
+    finally:
+        log.info("[DBT-DEBOUNCER] stopped")
+
+
+def start_dbt_debouncer() -> None:
+    """Start the debouncer worker thread once. Safe to call from gRPC thread."""
+    global _DBT_WORKER_THREAD
+    if _DBT_WORKER_THREAD and _DBT_WORKER_THREAD.is_alive():
+        return
+
+    with _DBT_PENDING_LOCK:
+        _load_pending_models_from_disk()
+
+    _DBT_WORKER_STOP.clear()
+    t = threading.Thread(
+        target=_dbt_worker_loop,
+        args=(int(DBT_DEBOUNCE_SECONDS), int(DBT_MAX_MODELS_PER_RUN)),
+        name="dbt-debouncer",
+        daemon=True,
+    )
+    t.start()
+    _DBT_WORKER_THREAD = t
+
+
+def stop_dbt_debouncer() -> None:
+    """Signal the debouncer to stop and wake it so it exits promptly."""
+    _DBT_WORKER_STOP.set()
+    _DBT_WAKE.set()
+    t = _DBT_WORKER_THREAD
+    if t and t.is_alive():
+        t.join(timeout=15)
+
 
 # gRPC server threading primitives
 VAULT_GRPC_STOP_EVENT = threading.Event()
 VAULT_GRPC_THREAD: threading.Thread | None = None
 
-def set_global_spark(spark):
-    global _SPARK
-    _SPARK = spark
-    _SPARK_READY.set()
+def _is_pool_closed_error(exc: Exception) -> bool:
+    return "pool is closed" in str(exc).lower()
 
-def get_global_spark(timeout_s=30):
-    if not _SPARK_READY.wait(timeout_s):
-        return None
-    return _SPARK
+
+def _is_pool_exhausted_error(exc: Exception) -> bool:
+    # psycopg2.pool raises PoolError("connection pool exhausted")
+    return "connection pool exhausted" in str(exc).lower()
+
+
+def _reset_postgres_pool(reason: str = "") -> None:
+    """Close and discard the global pool (safe to call multiple times)."""
+    global PG_POOL
+    with _PG_POOL_LOCK:
+        pool = PG_POOL
+        PG_POOL = None  # IMPORTANT: ensure next init truly recreates
+    if pool is not None:
+        try:
+            pool.closeall()
+        except Exception:
+            pass
+    if reason:
+        log.warning("PostgreSQL pool reset (%s).", reason)
 
 def _graceful_shutdown(signum=None, frame=None):
     """Handle SIGTERM/SIGINT and atexit: stop CDC + drain/stop Spark cleanly."""
@@ -295,7 +475,25 @@ def run_dbt_models(models):
     except Exception as e:
         log.warning(f"[DBT] Could not parse existing schema.yml (will regenerate): {e}")
 
-    merged = sorted(existing_tables.union(referenced_tables))
+    all_model_tables = set()
+    try:
+        if os.path.exists(DBT_MODELS_JSON_DIR):
+            for fname in os.listdir(DBT_MODELS_JSON_DIR):
+                if not fname.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(DBT_MODELS_JSON_DIR, fname), "r", encoding="utf-8") as f:
+                        j = json.load(f)
+                    t = (j.get("table_name") or "").strip()
+                    if t:
+                        all_model_tables.add(str(t).strip().lower())
+                except Exception:
+                    # Best-effort: ignore malformed/partial files
+                    continue
+    except Exception as e:
+        log.warning(f"[DBT] Could not scan model metadata directory for schema sources: {e}")
+
+    merged = sorted(existing_tables.union(referenced_tables).union(all_model_tables))
     generate_schema_yml(merged, output_path=schema_path)
 
     cmd = [
@@ -317,92 +515,6 @@ def run_dbt_models(models):
 
         if proc.returncode != 0:
             raise RuntimeError(f"dbt failed (rc={proc.returncode})")
-
-def queue_dbt_models(models: Iterable[str]) -> None:
-    """Collect models to run; actual run is done by the debouncer thread."""
-    if not models:
-        return
-    with _DBT_PENDING_LOCK:
-        for m in models:
-            if m:  # guard against Nones/empties
-                _DBT_PENDING_MODELS.add(m)
-
-def _drain_models(max_models: int | None = None) -> list[str]:
-    """Atomically take up to max_models models from the pending set."""
-    with _DBT_PENDING_LOCK:
-        if not _DBT_PENDING_MODELS:
-            return []
-        if max_models is None or max_models >= len(_DBT_PENDING_MODELS):
-            batch = sorted(_DBT_PENDING_MODELS)
-            _DBT_PENDING_MODELS.clear()
-            return batch
-        # take a bounded slice to avoid huge single runs (optional)
-        batch = sorted(list(_DBT_PENDING_MODELS)[:max_models])
-        _DBT_PENDING_MODELS.difference_update(batch)
-        return batch
-
-def _dbt_worker_loop(interval_seconds: int, max_models_per_run: int) -> None:
-    """Background loop that periodically runs dbt for accumulated models."""
-    log.info("[DBT-DEBOUNCER] started: interval=%ss, max_models_per_run=%s",
-             interval_seconds, max_models_per_run)
-    try:
-        next_wakeup = time.time() + interval_seconds
-        while not _DBT_WORKER_STOP.is_set():
-            now = time.time()
-
-            # If we've hit the max pending models, run immediately.
-            with _DBT_PENDING_LOCK:
-                pending_count = len(_DBT_PENDING_MODELS)
-
-            if pending_count >= max_models_per_run:
-                batch = _drain_models(max_models_per_run)
-                if batch:
-                    log.info("[DBT-DEBOUNCER] early run (size=%s): %s", len(batch), batch)
-                    run_dbt_models(batch)
-                next_wakeup = now + interval_seconds
-
-            # Normal wake-up
-            timeout = max(0.0, next_wakeup - now)
-            _DBT_WORKER_STOP.wait(timeout)
-            if _DBT_WORKER_STOP.is_set():
-                break
-
-            # Periodic run
-            batch = _drain_models(max_models_per_run)
-            if batch:
-                log.info("[DBT-DEBOUNCER] periodic run (size=%s): %s", len(batch), batch)
-                run_dbt_models(batch)
-            next_wakeup = time.time() + interval_seconds
-
-        # Drain anything left on shutdown
-        final = _drain_models(None)
-        if final:
-            log.info("[DBT-DEBOUNCER] draining on shutdown (size=%s): %s", len(final), final)
-            run_dbt_models(final)
-    finally:
-        log.info("[DBT-DEBOUNCER] stopped")
-
-def start_dbt_debouncer() -> None:
-    """Start the debouncer worker thread once."""
-    global _DBT_WORKER_THREAD
-    if _DBT_WORKER_THREAD and _DBT_WORKER_THREAD.is_alive():
-        return
-    t = threading.Thread(
-        target=_dbt_worker_loop,
-        args=(DBT_DEBOUNCE_SECONDS, DBT_MAX_MODELS_PER_RUN),
-        name="dbt-debouncer",
-        daemon=True,
-    )
-    _DBT_WORKER_STOP.clear()
-    t.start()
-    _DBT_WORKER_THREAD = t
-
-def stop_dbt_debouncer() -> None:
-    """Signal the debouncer to stop and wait briefly."""
-    _DBT_WORKER_STOP.set()
-    t = _DBT_WORKER_THREAD
-    if t and t.is_alive():
-        t.join(timeout=15)
 
 def _resolve_thrift(target_cfg):
     """
@@ -449,14 +561,34 @@ def _resolve_thrift(target_cfg):
 def init_postgres_pool(minconn=None, maxconn=None):
     """
     Initialize and return a global psycopg2 connection pool.
-    This pool will be used by all threads.
+    Recreates the pool if the existing one is unusable/closed.
     """
     global PG_POOL
+
     if minconn is None:
         minconn = POSTGRES_POOL_MIN
     if maxconn is None:
         maxconn = POSTGRES_POOL_MAX
-    if PG_POOL is None:
+
+    with _PG_POOL_LOCK:
+        if PG_POOL is not None:
+            # Validate the pool is still usable (it can become "closed" after closeall()).
+            try:
+                c = PG_POOL.getconn()
+                PG_POOL.putconn(c)
+                log.debug("Reusing existing PostgreSQL connection pool.")
+                return PG_POOL
+            except Exception as e:
+                # Pool became unusable; recreate.
+                log.warning("Existing PostgreSQL pool unusable (%s). Recreating.", e)
+                old = PG_POOL
+                PG_POOL = None
+                try:
+                    old.closeall()
+                except Exception:
+                    pass
+
+        # Create a new pool
         try:
             PG_POOL = SimpleConnectionPool(
                 minconn,
@@ -468,62 +600,106 @@ def init_postgres_pool(minconn=None, maxconn=None):
                 password=RDBMS_PASSWORD,
             )
             log.info(f"PostgreSQL connection pool created (min={minconn}, max={maxconn}).")
+            return PG_POOL
         except Exception as e:
             log.error(f"Error establishing PostgreSQL connection pool: {e}")
             raise
-    else:
-        log.debug("Reusing existing PostgreSQL connection pool.")
-    return PG_POOL
 
 
 def connect_postgres():
     """
-        Get a connection from the pool.
-        """
-    pool = init_postgres_pool()
-    try:
-        conn = pool.getconn()
-        if conn.closed:
-            log.warning("Received closed connection from pool; replacing it.")
-            pool.putconn(conn, close=True)
+    Get a connection from the pool.
+    Recovers from:
+      - pool exhaustion (expand pool)
+      - pool closed (recreate pool)
+    """
+    # Small bounded retry to avoid transient races under load.
+    for attempt in range(1, 4):
+        pool = init_postgres_pool()
+        try:
             conn = pool.getconn()
-        log.debug("Acquired connection from pool.")
-        return conn
-    except Exception as e:
-        msg = str(e)
-        if "connection pool exhausted" in msg.lower():
-            new_max = pool.maxconn + 5
-            log.warning(
-                f"Connection pool exhausted. Expanding pool to {new_max} connections."
-            )
-            # close existing pool and recreate with larger size
-            try:
-                pool.closeall()
-            except Exception:
-                pass
-            # reinitialize pool with larger max
-            init_postgres_pool(pool.minconn, new_max)
-            pool = PG_POOL
-            conn = pool.getconn()
+            if conn.closed:
+                log.warning("Received closed connection from pool; replacing it.")
+                try:
+                    pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+                conn = pool.getconn()
+
+            log.debug("Acquired connection from pool.")
             return conn
-        log.error(f"Error getting connection from pool: {e}")
-        raise
+
+        except Exception as e:
+            # Handle pool exhaustion by expanding pool size.
+            if _is_pool_exhausted_error(e):
+                try:
+                    cur_max = getattr(pool, "maxconn", POSTGRES_POOL_MAX)
+                except Exception:
+                    cur_max = POSTGRES_POOL_MAX
+                new_max = int(cur_max) + 5
+                log.warning(f"Connection pool exhausted. Expanding pool to {new_max} connections.")
+
+                # IMPORTANT: ensure a new pool is actually created.
+                _reset_postgres_pool("expand")
+                init_postgres_pool(POSTGRES_POOL_MIN, new_max)
+
+                # Retry immediately
+                continue
+
+            # Handle closed pool by recreating and retrying.
+            if _is_pool_closed_error(e):
+                _reset_postgres_pool("closed")
+                continue
+
+            log.error(f"Error getting connection from pool: {e}")
+            raise
+
+        finally:
+            # Very small backoff on retries to avoid thundering herd
+            if attempt < 3:
+                time.sleep(0.05 * attempt)
+
+    # If we got here, we failed repeatedly.
+    raise RuntimeError("Failed to acquire Postgres connection from pool after retries.")
+
 
 def release_postgres_connection(conn):
     """
     Return the connection back to the pool.
+    If the pool is gone/closed, close the connection instead of raising.
     """
-    pool = init_postgres_pool()
+    global PG_POOL
+    if conn is None:
+        return
+
+    try:
+        pool = init_postgres_pool()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+
     try:
         if conn.closed:
-            pool.putconn(conn, close=True)
+            try:
+                pool.putconn(conn, close=True)
+            except Exception:
+                pass
             log.debug("Closed dead connection from pool.")
         else:
             pool.putconn(conn)
             log.debug("Released connection back to pool.")
     except Exception as e:
+        # If the pool was reset while the connection was in-flight, do not explode.
         log.error(f"Error releasing connection: {e}")
-
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if _is_pool_closed_error(e):
+            _reset_postgres_pool("release_failed_closed")
 def discover_lake():
     """
     Discover lake tables and return:
@@ -1002,7 +1178,7 @@ def streaming_dv_consumer_and_dbt(models_to_run):
     Generic, schema-late binding Kafka -> Bronze streaming consumer + dbt trigger.
     Writes bronze tables as Delta, auto-creating them, and triggers dbt per touched table.
     """
-    import os, json, shutil, threading  # FIX: add threading
+    import os, json, shutil
     from pyspark.sql import functions as F  # FIX: F used later
     from pyspark.sql.functions import col, from_json
     from pyspark.sql.types import StructType, StructField, StringType
@@ -1119,10 +1295,8 @@ def streaming_dv_consumer_and_dbt(models_to_run):
             except Exception as e:
                 log.exception("[STREAM][%s][epoch=%s] processing failed: %s", tbl, epoch_id, e)
 
-
     table_to_models = get_existing_model_tables()
 
-    # Use your unified writer (now fixed to force Delta)
     # Be tolerant to different callback signatures from bronze_ingestor
     def _after_write(*args, **kwargs):
         # Accept (touched,) or (touched, batch_id, counts)
@@ -1132,15 +1306,23 @@ def streaming_dv_consumer_and_dbt(models_to_run):
         if not written_tables:
             return
 
+        nonlocal table_to_models
+
+        # Refresh mapping if we see tables we don't know yet (models are generated at runtime).
+        if any(tbl not in table_to_models for tbl in written_tables):
+            table_to_models = get_existing_model_tables()
+
         models = set()
         for tbl in written_tables:
             for m in table_to_models.get(tbl, []):
                 models.add(m)
+
         if models:
             log.info("[DBT-QUEUE] epoch models=%s", sorted(models))
             queue_dbt_models(models)
 
-    allowed_tables = set(table_to_models.keys()) if table_to_models else None
+    # New datasets would be dropped, producing empty micro-batches and E2E timeouts.
+    allowed_tables = None
 
     query = start_bronze_writer(
         spark=spark,
@@ -1187,9 +1369,55 @@ def main():
     wait_for_lake(timeout_sec=60)
 
     with _SingletonRunLock():
+        # Create the stop event early so background workers can run during longer bootstrap phases.
+        stop_event = RUN.stop_event or threading.Event()
+        RUN.stop_event = stop_event
+
+        # Determine processing mode early (bulk runs must not start long-lived background threads).
+        processing_mode = (PROCESSING_MODE or "streaming").lower()
+        if processing_mode not in {"streaming", "bulk"}:
+            log.warning(f"[MODE] Unknown PROCESSING={PROCESSING_MODE} -> defaulting to 'streaming'")
+            processing_mode = "streaming"
+
         # -------- Phase 0: Discover lake + bootstrap Bronze/DBT scaffolding --------
         lake_tables, load_table = discover_lake()
         bootstrap_bronze(lake_tables, load_table)  # precreate empty bronze tables (DDL)
+
+        # Start CDC early, but ONLY after Kafka/topic is reachable to avoid long producer-blocking.
+        # Skip full-load for tables present at discovery; initial-load path establishes their watermarks.
+        if processing_mode == "streaming" and (RUN.cdc_thread is None or not RUN.cdc_thread.is_alive()):
+            cdc_skip_full_load_tables = set(lake_tables)
+
+            def _early_cdc_loop():
+                backoff = 2.0
+                while not stop_event.is_set():
+                    try:
+                        # Ensure topic + broker are ready BEFORE starting the infinite CDC loop.
+                        check_and_create_topic()
+                        wait_for_kafka(KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, timeout_sec=60)
+
+                        # Now run CDC loop (runs until stop_event is set)
+                        try:
+                            cdc_producer_insert_only(
+                                stop_event=stop_event,
+                                skip_full_load_tables=cdc_skip_full_load_tables,
+                            )
+                        except TypeError:
+                            # Backwards compatibility if signature doesn't include skip_full_load_tables
+                            cdc_producer_insert_only(stop_event=stop_event)
+                        return
+                    except Exception as exc:
+                        log.warning(
+                            f"[CDC Producer] Early-start loop error: {exc}; retrying in {backoff:.1f}s"
+                        )
+                        try:
+                            time.sleep(backoff)
+                        except Exception:
+                            pass
+
+            cdc_thread = threading.Thread(target=_early_cdc_loop, daemon=False, name="cdc-insert-only")
+            RUN.cdc_thread = cdc_thread
+            cdc_thread.start()
 
         generate_schema_yml(lake_tables)
         existing_models = get_existing_model_tables()
@@ -1219,6 +1447,7 @@ def main():
             log.info(f"[DBT] Will run for: {sorted(models_to_run)}")
             # Create raw_vault objects up-front (first run); later runs will also be triggered by streaming callback
             run_dbt_models(sorted(models_to_run))
+
         # Start the debounced DBT runner (coalesces per-batch model requests)
         start_dbt_debouncer()
 
@@ -1226,27 +1455,19 @@ def main():
         check_and_create_topic()  # make sure topic exists before streams/producers
         wait_for_kafka(KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, timeout_sec=60)
 
-        # Mode switch for CRON bulk runs
-        processing_mode = PROCESSING_MODE.lower()
-        if processing_mode not in {"streaming", "bulk"}:
-            log.warning(f"[MODE] Unknown PROCESSING={PROCESSING_MODE} -> defaulting to 'streaming'")
-            processing_mode = "streaming"
-
         # -------- Phase 2: Stream up (consumer) --------
-        stop_event = threading.Event()
-        RUN.stop_event = stop_event
+        # IMPORTANT: Do NOT overwrite stop_event here (that breaks early CDC + graceful shutdown).
         query = None
-        query_holder = {"q": None}
         if processing_mode == "streaming":
-            # Start stream and keep handle (non-blocking; returns StreamingQuery)
             query = streaming_dv_consumer_and_dbt(models_to_run)
-            query_holder["q"] = query
             RUN.query = query
+
             # Small settle time so Spark attaches before initial production
             try:
                 time.sleep(1)
             except Exception:
                 pass
+
             # Maintenance watchdog (pause/resume around daily prune)
             threading.Thread(
                 target=maintenance_watchdog,
@@ -1254,12 +1475,11 @@ def main():
                 daemon=True,
                 name="Maintenance Watchdog",
             ).start()
+
         # -------- Phase 3: Initial full load (backlog) --------
-        if processing_mode == 'bulk':
-            # TODO: IMPLEMENT CRON JOB FRIENDLY PROCESSING ---> SEE DataLake service
+        if processing_mode == "bulk":
             log.info("[PROCESSING-MODE] BULK: producing once for all lake tables and exiting")
-            produced_map = produce_tables_once(sorted(lake_tables))  # CRON-friendly one shot
-            # Assert that Kafka actually received what we produced
+            produced_map = produce_tables_once(sorted(lake_tables))
             wait_for_kafka_increase(sum(produced_map.values()), timeout_sec=60)
             return
         else:
@@ -1269,8 +1489,10 @@ def main():
                 bootstrap=KAFKA_BOOTSTRAP_SERVERS,
                 topic=os.getenv("KAFKA_TOPIC", "lake_stream"),
             )
-            log.info("[ASSERT][KAFKA_OFFSETS][BASE] bootstrap=%s topic=%s base_total=%s",
-                     KAFKA_BOOTSTRAP_SERVERS, os.getenv("KAFKA_TOPIC", "lake_stream"), base_total)
+            log.info(
+                "[ASSERT][KAFKA_OFFSETS][BASE] bootstrap=%s topic=%s base_total=%s",
+                KAFKA_BOOTSTRAP_SERVERS, os.getenv("KAFKA_TOPIC", "lake_stream"), base_total
+            )
 
             produced_once = set()
             produced_total = 0
@@ -1278,7 +1500,7 @@ def main():
             if tables_needing_initial_load:
                 todo = sorted(list(tables_needing_initial_load))
                 log.info("[INITIAL LOAD] Producing full load for tables: %s", todo)
-                produced_map = produce_tables_once(todo) or {}  # make sure this returns a dict
+                produced_map = produce_tables_once(todo) or {}
                 produced_total += sum(produced_map.values())
                 produced_once |= set(todo)
 
@@ -1297,33 +1519,45 @@ def main():
                 topic=os.getenv("KAFKA_TOPIC", "lake_stream"),
             )
 
-            # 3) gate on Spark seeing the growth
+            # 3) Gate on Spark seeing the growth
             from utils.helper_service_ready import wait_for_stream_offset_growth
-            q = get_active_stream_query_by_name("lake_stream-generic-ingestor") or query  # small helper you add
+
+            # Avoid hard dependency on any helper that may not exist; prefer active query.
+            q = query
+            try:
+                helper = globals().get("get_active_stream_query_by_name")
+                if callable(helper):
+                    q = helper("lake_stream-generic-ingestor") or query
+            except Exception:
+                q = query
+
             if q:
                 wait_for_stream_offset_growth(q, produced_total=produced_total, base_total=base_total, timeout_sec=60)
                 log.info("[STREAM][status] isActive=%s", q.isActive)
                 lp = q.lastProgress or {}
-                log.info("[STREAM][source-desc] %s", (lp.get("sources", [{}])[0].get("description")))
+                try:
+                    log.info("[STREAM][source-desc] %s", (lp.get("sources", [{}])[0].get("description")))
+                except Exception:
+                    pass
 
         # -------- Phase 4: Continuous CDC producer (insert-only) --------
-        def _cdc_loop():
-            try:
-                cdc_producer_insert_only(stop_event=stop_event)
-            except TypeError:
-                cdc_producer_insert_only()
+        # IMPORTANT: Do not start a second CDC thread if early CDC is already running.
+        if RUN.cdc_thread is None or not RUN.cdc_thread.is_alive():
+            def _cdc_loop():
+                try:
+                    cdc_producer_insert_only(stop_event=stop_event)
+                except TypeError:
+                    cdc_producer_insert_only()
 
-        cdc_thread = threading.Thread(target=_cdc_loop, daemon=False, name="cdc-insert-only")
-        RUN.cdc_thread = cdc_thread
-        cdc_thread.start()
+            cdc_thread = threading.Thread(target=_cdc_loop, daemon=False, name="cdc-insert-only")
+            RUN.cdc_thread = cdc_thread
+            cdc_thread.start()
 
         # -------- Phase 5: Lifecycle / graceful shutdown --------
         try:
             if query is not None:
-                # Block until SIGTERM/SIGINT or query.stop()
                 query.awaitTermination()
             else:
-                # Non-streaming mode: idle but responsive to signals
                 while not stop_event.is_set():
                     time.sleep(1)
         except KeyboardInterrupt:
@@ -1333,6 +1567,7 @@ def main():
                 stop_dbt_debouncer()
             finally:
                 _graceful_shutdown()
+
 
 
 if __name__ == "__main__":
