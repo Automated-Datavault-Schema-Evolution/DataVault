@@ -25,13 +25,14 @@ def introspect_lake_columns(spark: SparkSession, table: str) -> List[str]:
     """
     Canonical column list for a lake table (order stable).
     - rdbms: query information_schema.columns case-insensitively (handles quoted mixed-case identifiers)
-    - parquet: read parquet schema
+    - parquet: supports BOTH:
+        (A) single-file parquet:   PARQUET_PATH/<table>.parquet
+        (B) delta-root layout:     PARQUET_PATH/<table>/  (contains _delta_log/)
     """
     if LAKE_TYPE == "rdbms":
         schema_esc = _escape_sql_literal(RDBMS_SCHEMA)
         table_esc = _escape_sql_literal(table)
 
-        # Case-insensitive lookup to survive mixed-case quoted table names in Postgres
         query = (
             "(SELECT column_name "
             f" FROM information_schema.columns"
@@ -46,13 +47,66 @@ def introspect_lake_columns(spark: SparkSession, table: str) -> List[str]:
         return cols
 
     if LAKE_TYPE == "parquet":
-        path = os.path.join(PARQUET_PATH, f"{table}.parquet")
-        df = spark.read.parquet(path).limit(0)
-        cols = [c.lower() for c in df.columns]
+        # In this repo "parquet" means *Delta Lake on parquet*.
+        # The lake root is PARQUET_PATH (e.g. /lake) with per-table directories.
+        # For backwards compatibility, we also support a single-file <table>.parquet layout.
+
+        def _resolve_case_insensitive_entry(root: str, want: str) -> str | None:
+            """Resolve an entry under `root` by case-insensitive match."""
+            try:
+                want_l = want.lower()
+                for e in os.listdir(root):
+                    if e.lower() == want_l:
+                        return os.path.join(root, e)
+            except Exception:
+                return None
+            return None
+
+        def _resolve_delta_dir(root: str, tbl: str) -> str | None:
+            # 1) Exact match
+            exact = os.path.join(root, tbl)
+            if os.path.isdir(os.path.join(exact, "_delta_log")):
+                return exact
+            # 2) Case-insensitive match
+            ci = _resolve_case_insensitive_entry(root, tbl)
+            if ci and os.path.isdir(os.path.join(ci, "_delta_log")):
+                return ci
+            return None
+
+        def _resolve_parquet_file(root: str, tbl: str) -> str | None:
+            # 1) Exact match
+            exact = os.path.join(root, f"{tbl}.parquet")
+            if os.path.exists(exact):
+                return exact
+            # 2) Case-insensitive match
+            ci = _resolve_case_insensitive_entry(root, f"{tbl}.parquet")
+            if ci and os.path.exists(ci):
+                return ci
+            return None
+
+        # 1) Prefer Delta table directory: <PARQUET_PATH>/<table>/
+        delta_dir = _resolve_delta_dir(PARQUET_PATH, str(table))
+        try:
+            if delta_dir:
+                df0 = spark.read.format("delta").load(delta_dir).limit(0)
+                cols = [c.lower() for c in df0.columns]
+                log.debug(f"[Schema] Delta columns for {table}: {cols}")
+                return cols
+        except Exception as e:
+            log.debug(f"[Schema] Delta introspection failed for {table} at {delta_dir}: {e}")
+
+        # 2) Fallback: plain parquet file <PARQUET_PATH>/<table>.parquet
+        parquet_file = _resolve_parquet_file(PARQUET_PATH, str(table))
+        if not parquet_file or not os.path.exists(parquet_file):
+            return []
+        df0 = spark.read.parquet(parquet_file).limit(0)
+        cols = [c.lower() for c in df0.columns]
         log.debug(f"[Schema] Parquet columns for {table}: {cols}")
         return cols
 
     raise ValueError(f"Unsupported LAKE_TYPE: {LAKE_TYPE}")
+
+
 
 def bronze_target_columns(spark: SparkSession, table: str) -> List[str]:
     """

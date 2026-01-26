@@ -32,7 +32,8 @@ def wait_for_kafka(bootstrap, topic, timeout_sec: int = 60):
 def wait_for_lake(timeout_sec: int = 60):
     """
     Block until the lake is reachable.
-    - parquet: wait until PARQUET_PATH exists and contains at least one .parquet file (or is readable)
+    - parquet: treat PARQUET_PATH as a Delta root (/lake). Ready when the directory exists and is listable.
+              (Do NOT require '*.parquet' files at root; delta tables are directories.)
     - rdbms: wait until a connection can be established and SELECT 1 succeeds.
     """
     start = time.time()
@@ -42,14 +43,24 @@ def wait_for_lake(timeout_sec: int = 60):
         while time.time() - start < timeout_sec:
             try:
                 if os.path.isdir(PARQUET_PATH):
-                    # readiness: directory exists; optionally ensure it is listable
-                    files = [f for f in os.listdir(PARQUET_PATH) if f.endswith(".parquet")]
-                    log.info(f"[SERVICE_READY][DATA_LAKE] PARQUET_PATH='{PARQUET_PATH}', parquet_files={len(files)}")
+                    # must be listable
+                    entries = os.listdir(PARQUET_PATH)
+                    # best-effort signal: delta tables are directories containing _delta_log
+                    delta_dirs = 0
+                    try:
+                        for e in entries:
+                            p = os.path.join(PARQUET_PATH, e)
+                            if os.path.isdir(p) and os.path.isdir(os.path.join(p, "_delta_log")):
+                                delta_dirs += 1
+                    except Exception:
+                        pass
+                    log.info(f"[SERVICE_READY][DATA_LAKE] PARQUET_PATH='{PARQUET_PATH}', entries={len(entries)}, delta_tables={delta_dirs}")
                     return
             except Exception as e:
                 last_error = e
             time.sleep(1.0)
-        raise TimeoutError(f"[SERVICE_NOT_READY][DATA_LAKE] Parquet lake not ready at '{PARQUET_PATH}': {last_error}")
+        raise TimeoutError(f"[SERVICE_NOT_READY][DATA_LAKE] Parquet/Delta lake not ready at '{PARQUET_PATH}': {last_error}")
+
     elif LAKE_TYPE.lower() == "rdbms":
         while time.time() - start < timeout_sec:
             import psycopg2
@@ -66,15 +77,17 @@ def wait_for_lake(timeout_sec: int = 60):
                 cur.fetchone()
                 cur.close()
                 conn.close()
-                log.info(f"[SERVICE_READY][DATA_LAKE] RDBMS connection established")
+                log.info("[SERVICE_READY][DATA_LAKE] RDBMS connection established")
                 return
             except Exception as e:
                 last_error = e
                 time.sleep(1.0)
         raise TimeoutError(
-            f"[SERVICE_NOT_READY][DATA_LAKE] RDBMS lake not ready (host={RDBMS_HOST}, db={RDBMS_DB}): {last_error}")
+            f"[SERVICE_NOT_READY][DATA_LAKE] RDBMS lake not ready (host={RDBMS_HOST}, db={RDBMS_DB}): {last_error}"
+        )
     else:
         log.error(f"[SERVICE_NOT_READY][DATA_LAKE] Unknown LAKE_TYPE='{LAKE_TYPE}', continuing without wait")
+
 
 
 def _sum_latest_offsets_from_progress(progress_json: dict) -> int:

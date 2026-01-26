@@ -31,15 +31,43 @@ METASTORE_POOL_ACQUIRE_TIMEOUT_S = float(os.getenv("METASTORE_POOL_ACQUIRE_TIMEO
 METASTORE_POOL_ACQUIRE_RETRY_S = float(os.getenv("METASTORE_POOL_ACQUIRE_RETRY_S", "0.2"))
 
 _POOL_LOCK = threading.Lock()
-
+_PARQUET_APPEND_LOCK = threading.Lock()
 
 def _append_parquet(row, path):
-    if os.path.exists(path):
-        df = pd.read_parquet(path)
-        df = pd.concat([df, row], ignore_index=True)
-    else:
-        df = row
-    df.to_parquet(path, index=False)
+    """
+    Append a row (DataFrame) to a parquet file at `path`.
+
+    Minimal hardening:
+      - Ensure parent directory exists (fixes: Cannot save file into a non-existent directory: 'meta')
+      - Serialize read/concat/write to avoid concurrent corruption under gRPC load
+      - Use atomic replace to avoid partially-written parquet files
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with _PARQUET_APPEND_LOCK:
+        if os.path.exists(path):
+            try:
+                df_existing = pd.read_parquet(path)
+                df = pd.concat([df_existing, row], ignore_index=True)
+            except Exception as exc:
+                # If file is corrupt/half-written, overwrite with the new row rather than failing every retry
+                log.warning(f"[META] Failed reading existing parquet {path!r}: {exc}; overwriting.")
+                df = row
+        else:
+            df = row
+
+        tmp_path = f"{path}.tmp-{uuid.uuid4().hex}"
+        try:
+            df.to_parquet(tmp_path, index=False)
+            os.replace(tmp_path, path)  # atomic on POSIX
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 def _ensure_metastore_db():

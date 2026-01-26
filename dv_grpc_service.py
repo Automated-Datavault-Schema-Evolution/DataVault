@@ -12,7 +12,7 @@ import grpc
 import threading
 import time
 from logger import log
-from config import DBT_MODELS_JSON_DIR
+from config import DBT_MODELS_JSON_DIR, LAKE_TYPE
 from meta_store import write_metadata
 from proto import sef_handlers_pb2 as pb
 from proto import sef_handlers_pb2_grpc as pb_grpc
@@ -29,6 +29,16 @@ from main import (
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+def _physical_table_name(name: str) -> str:
+    n = (name or "").strip()
+    if not n:
+        return n
+    if "." in n:
+        n = n.split(".", 1)[-1]
+    n = n.strip('"').replace(".", "_").replace("-", "_")
+    return n if LAKE_TYPE == "rdbms" else n.lower()
+
+
 def _default_business_keys(table_name: str, models_for_table: List[Dict[str, Any]]) -> List[str]:
     """
     Best-effort business key selection.
@@ -76,12 +86,22 @@ def _make_evidence_id(operation: pb.Operation) -> str:
 
 def _load_table_schema(table_name: str):
     """
-    Use the existing discover_lake() to get a schema DataFrame for a table.
+    Use discover_lake() to get a schema DataFrame for a table.
+
+    Parquet/Delta mode stores physical dirs lowercased; callers (SEF/tests) may pass mixed-case.
+    We resolve the requested logical name to the discovered physical name.
     """
     tables, load_table = discover_lake()
-    if table_name not in tables:
-        raise ValueError(f"Table {table_name!r} not found in lake tables {tables}")
-    return load_table(table_name)
+
+    wanted = _physical_table_name(table_name)
+    phys_map = {_physical_table_name(t): t for t in tables}
+
+    physical = phys_map.get(wanted)
+    if physical is None:
+        raise ValueError(f"Table {table_name!r} (phys={wanted!r}) not found in lake tables {tables}")
+
+    return load_table(physical)
+
 
 
 def _load_models_for_table(table_name: str) -> List[Dict[str, Any]]:
@@ -237,6 +257,7 @@ def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
             error_code="MISSING_TARGET",
             error_message="target (table_name) is required for OPERATION_ADD_COLUMN",
         )
+    table_name = _physical_table_name(table_name)
 
     models_for_table = _load_models_for_table(table_name)
     existing_sats = _models_by_type(models_for_table, "sat")
@@ -362,6 +383,7 @@ def _handle_new_hub_for_vault(operation: pb.Operation) -> pb.OperationResult:
             error_code="MISSING_TARGET",
             error_message="target (table_name) is required for OPERATION_NEW_HUB",
         )
+    table_name = _physical_table_name(table_name)
 
     models_for_table = _load_models_for_table(table_name)
     existing_hubs = _models_by_type(models_for_table, "hub")
@@ -457,6 +479,7 @@ def _handle_new_link_for_vault(operation: pb.Operation) -> pb.OperationResult:
             error_code="MISSING_TARGET",
             error_message="target (table_name) is required for OPERATION_NEW_LINK",
         )
+    table_name = _physical_table_name(table_name)
 
     try:
         meta, hubs, links, sats = _discover_and_split(table_name)
@@ -612,6 +635,7 @@ def _handle_change_type_for_vault(operation: pb.Operation) -> pb.OperationResult
             error_code="MISSING_TARGET",
             error_message="target (table_name) is required for OPERATION_CHANGE_TYPE",
         )
+    table_name = _physical_table_name(table_name)
 
     evidence_id = _make_evidence_id(operation)
 
@@ -689,6 +713,7 @@ def _handle_drop_column_for_vault(operation: pb.Operation) -> pb.OperationResult
             error_code="MISSING_TARGET",
             error_message="target (table_name) is required for OPERATION_DROP_COLUMN",
         )
+    table_name = _physical_table_name(table_name)
 
     evidence_id = _make_evidence_id(operation)
 
@@ -849,147 +874,159 @@ class VaultHandlerService(pb_grpc.VaultHandlerServicer):
         request: pb.OperationBatch,
         context: grpc.ServicerContext,
     ) -> pb.OperationBatchResult:
-        results: List[pb.OperationResult] = []
+        try:
+            results: List[pb.OperationResult] = []
 
-        for op in request.operations:
-            kind_name = pb.OperationKind.Name(op.kind)
-            layer_name = pb.Layer.Name(op.layer)
+            for op in request.operations:
+                kind_name = pb.OperationKind.Name(op.kind)
+                layer_name = pb.Layer.Name(op.layer)
 
-            log.info(
-                f"[GRPC_SERVICE] VaultHandler.ApplyOperations: plan_id={op.plan_id} correlation_id="
-                f"{op.correlation_id} layer={layer_name} target={op.target} kind={kind_name} params={dict(op.params)}"
-            )
-
-            try:
-                if op.layer != pb.LAYER_VAULT:
-                    result = pb.OperationResult(
-                        correlation_id=op.correlation_id,
-                        plan_id=op.plan_id,
-                        idempotency_key=op.idempotency_key,
-                        status=pb.OPERATION_STATUS_ALREADY_APPLIED,
-                        error_code="WRONG_LAYER",
-                        error_message=f"Operation layer {layer_name} not handled by VaultHandler",
-                    )
-                elif op.kind == pb.OPERATION_ADD_COLUMN:
-                    result = _handle_add_column_for_vault(op)
-                elif op.kind == pb.OPERATION_NEW_HUB:
-                    result = _handle_new_hub_for_vault(op)
-                elif op.kind == pb.OPERATION_NEW_LINK:
-                    result = _handle_new_link_for_vault(op)
-                elif op.kind == pb.OPERATION_CHANGE_TYPE:
-                    result = _handle_change_type_for_vault(op)
-                elif op.kind == pb.OPERATION_DROP_COLUMN:
-                    result = _handle_drop_column_for_vault(op)
-                else:
-                    msg = f"[GRPC_SERVICE] Operation kind {kind_name} not supported by VaultHandler"
-                    log.error(msg)
-                    result = pb.OperationResult(
-                        correlation_id=op.correlation_id,
-                        plan_id=op.plan_id,
-                        idempotency_key=op.idempotency_key,
-                        status=pb.OPERATION_STATUS_PERMANENT_ERROR,
-                        error_code="UNSUPPORTED_OPERATION",
-                        error_message=msg,
-                    )
-
-            except Exception as exc:
-                # IMPORTANT: never let exceptions escape the gRPC handler, otherwise
-                # SEF sees StatusCode.UNKNOWN/UNAVAILABLE and cannot distinguish transient
-                # dependency issues from permanent failures.
-                msg = f"[GRPC_SERVICE] Exception calling application: {exc}"
-                log.exception(msg)
-
-                # Mark as transient: SEF should retry.
-                result = pb.OperationResult(
-                    correlation_id=op.correlation_id,
-                    plan_id=op.plan_id,
-                    idempotency_key=op.idempotency_key,
-                    status=pb.OPERATION_STATUS_TRANSIENT_ERROR,
-                    error_code="DV_TRANSIENT_ERROR",
-                    error_message=msg,
-                    evidence_snapshot_id=_make_evidence_id(op),
+                log.info(
+                    f"[GRPC_SERVICE] VaultHandler.ApplyOperations: plan_id={op.plan_id} correlation_id="
+                    f"{op.correlation_id} layer={layer_name} target={op.target} kind={kind_name} params={dict(op.params)}"
                 )
 
-                # Best-effort: record the failure as metadata (do not raise on failure)
                 try:
-                    write_metadata(
-                        {
-                            "layer": "vault",
-                            "target": op.target,
-                            "plan_id": op.plan_id,
-                            "correlation_id": op.correlation_id,
-                            "idempotency_key": op.idempotency_key,
-                            "operation_kind": kind_name,
-                            "params": dict(op.params),
-                            "evidence_id": result.evidence_snapshot_id,
-                            "source": "vault_handler_grpc",
-                            "note": f"transient_error: {exc}",
-                        }
+                    if op.layer != pb.LAYER_VAULT:
+                        result = pb.OperationResult(
+                            correlation_id=op.correlation_id,
+                            plan_id=op.plan_id,
+                            idempotency_key=op.idempotency_key,
+                            status=pb.OPERATION_STATUS_ALREADY_APPLIED,
+                            error_code="WRONG_LAYER",
+                            error_message=f"Operation layer {layer_name} not handled by VaultHandler",
+                        )
+                    elif op.kind == pb.OPERATION_ADD_COLUMN:
+                        result = _handle_add_column_for_vault(op)
+                    elif op.kind == pb.OPERATION_NEW_HUB:
+                        result = _handle_new_hub_for_vault(op)
+                    elif op.kind == pb.OPERATION_NEW_LINK:
+                        result = _handle_new_link_for_vault(op)
+                    elif op.kind == pb.OPERATION_CHANGE_TYPE:
+                        result = _handle_change_type_for_vault(op)
+                    elif op.kind == pb.OPERATION_DROP_COLUMN:
+                        result = _handle_drop_column_for_vault(op)
+                    else:
+                        msg = f"[GRPC_SERVICE] Operation kind {kind_name} not supported by VaultHandler"
+                        log.error(msg)
+                        result = pb.OperationResult(
+                            correlation_id=op.correlation_id,
+                            plan_id=op.plan_id,
+                            idempotency_key=op.idempotency_key,
+                            status=pb.OPERATION_STATUS_PERMANENT_ERROR,
+                            error_code="UNSUPPORTED_OPERATION",
+                            error_message=msg,
+                        )
+
+                except Exception as exc:
+                    # IMPORTANT: never let exceptions escape the gRPC handler, otherwise
+                    # SEF sees StatusCode.UNKNOWN/UNAVAILABLE and cannot distinguish transient
+                    # dependency issues from permanent failures.
+                    msg = f"[GRPC_SERVICE] Exception calling application: {exc}"
+                    log.exception(msg)
+
+                    # Mark as transient: SEF should retry.
+                    result = pb.OperationResult(
+                        correlation_id=op.correlation_id,
+                        plan_id=op.plan_id,
+                        idempotency_key=op.idempotency_key,
+                        status=pb.OPERATION_STATUS_TRANSIENT_ERROR,
+                        error_code="DV_TRANSIENT_ERROR",
+                        error_message=msg,
+                        evidence_snapshot_id=_make_evidence_id(op),
                     )
-                except Exception:
-                    pass
 
-            results.append(result)
+                    # Best-effort: record the failure as metadata (do not raise on failure)
+                    try:
+                        write_metadata(
+                            {
+                                "layer": "vault",
+                                "target": op.target,
+                                "plan_id": op.plan_id,
+                                "correlation_id": op.correlation_id,
+                                "idempotency_key": op.idempotency_key,
+                                "operation_kind": kind_name,
+                                "params": dict(op.params),
+                                "evidence_id": result.evidence_snapshot_id,
+                                "source": "vault_handler_grpc",
+                                "note": f"transient_error: {exc}",
+                            }
+                        )
+                    except Exception:
+                        pass
 
-        return pb.OperationBatchResult(results=results)
+                results.append(result)
+
+            return pb.OperationBatchResult(results=results)
+        except Exception as e:
+            log.exception("[GRPC_SERVICE] ApplyOperations crashed: %s", e)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return pb.OperationBatchResult(results=[])
 
     def IntrospectEvidence(
         self,
         request: pb.EvidenceRequest,
         context: grpc.ServicerContext,
     ) -> pb.EvidenceResponse:
-        table_name = request.dataset_id  # assuming dataset_id == lake table name
+        try:
+            table_name = request.dataset_id  # assuming dataset_id == lake table name
+            table_name = _physical_table_name(table_name)
+            log.info(
+                f"[GRPC_SERVICE] VaultHandler.IntrospectEvidence: plan_id={request.plan_id} correlation_id="
+                f"{request.correlation_id} dataset_id={table_name}")
 
-        log.info(
-            f"[GRPC_SERVICE] VaultHandler.IntrospectEvidence: plan_id={request.plan_id} correlation_id="
-            f"{request.correlation_id} dataset_id={table_name}")
+            info = _introspect_vault_for_table(table_name)
+            vaults = info["vaults"]
+            tables = info["tables"]
 
-        info = _introspect_vault_for_table(table_name)
-        vaults = info["vaults"]
-        tables = info["tables"]
-
-        pb_tables: List[pb.TableDescriptor] = []
-        for t in tables:
-            attrs = [
-                pb.AttributeDescriptor(
-                    name=c,
-                    logical_type="",
-                    physical_type="",
-                    nullable=True,
+            pb_tables: List[pb.TableDescriptor] = []
+            for t in tables:
+                attrs = [
+                    pb.AttributeDescriptor(
+                        name=c,
+                        logical_type="",
+                        physical_type="",
+                        nullable=True,
+                    )
+                    for c in t.get("columns", [])
+                ]
+                pb_tables.append(
+                    pb.TableDescriptor(
+                        name=t["name"],
+                        attributes=attrs,
+                    )
                 )
-                for c in t.get("columns", [])
-            ]
-            pb_tables.append(
-                pb.TableDescriptor(
-                    name=t["name"],
-                    attributes=attrs,
+
+            pb_vaults: List[pb.VaultDescriptor] = []
+            for v in vaults:
+                pb_vaults.append(
+                    pb.VaultDescriptor(
+                        hub=v["hub"],
+                        links=v["links"],
+                        satellites=v["satellites"],
+                    )
                 )
+
+            raw = {
+                "dataset_id": table_name,
+                "plan_id": request.plan_id,
+                "vaults": vaults,
+                "tables": tables,
+            }
+
+            return pb.EvidenceResponse(
+                correlation_id=request.correlation_id,
+                plan_id=request.plan_id,
+                tables=pb_tables,
+                vault_structures=pb_vaults,
+                raw_evidence_json=json.dumps(raw),
             )
-
-        pb_vaults: List[pb.VaultDescriptor] = []
-        for v in vaults:
-            pb_vaults.append(
-                pb.VaultDescriptor(
-                    hub=v["hub"],
-                    links=v["links"],
-                    satellites=v["satellites"],
-                )
-            )
-
-        raw = {
-            "dataset_id": table_name,
-            "plan_id": request.plan_id,
-            "vaults": vaults,
-            "tables": tables,
-        }
-
-        return pb.EvidenceResponse(
-            correlation_id=request.correlation_id,
-            plan_id=request.plan_id,
-            tables=pb_tables,
-            vault_structures=pb_vaults,
-            raw_evidence_json=json.dumps(raw),
-        )
+        except Exception as e:
+            log.exception("[GRPC_SERVICE] IntrospectEvidence crashed: %s", e)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return pb.OperationBatchResult(results=[])
 
     def ProbeLinkCandidates(
             self,
@@ -998,7 +1035,7 @@ class VaultHandlerService(pb_grpc.VaultHandlerServicer):
     ) -> pb.LinkProbeResponse:
         table_name = request.table_name
         fk_filter = request.fk_filter or None
-
+        table_name = _physical_table_name(table_name)
         log.info(
             f"[GRPC_SERVICE] VaultHandler.ProbeLinkCandidates: plan_id={request.plan_id} "
             f"correlation_id={request.correlation_id} table_name={table_name} fk_filter={fk_filter}"
@@ -1059,8 +1096,18 @@ def serve(stop_event: "threading.Event | None" = None) -> None:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
     pb_grpc.add_VaultHandlerServicer_to_server(VaultHandlerService(), server)
 
-    listen_addr = f"[::]:{port}"
-    server.add_insecure_port(listen_addr)
+    listen_host = os.getenv("VAULT_GRPC_LISTEN_HOST", "0.0.0.0")
+    listen_addr = f"{listen_host}:{port}"
+
+    bound = server.add_insecure_port(listen_addr)
+    if not bound:
+        # Hard fallback (should be rare): try IPv6 bind as a last resort
+        listen_addr_v6 = f"[::]:{port}"
+        bound_v6 = server.add_insecure_port(listen_addr_v6)
+        if not bound_v6:
+            raise RuntimeError(f"Could not bind gRPC server on {listen_addr} or {listen_addr_v6}")
+        listen_addr = listen_addr_v6
+
     log.info("Starting Vault gRPC handler on %s", listen_addr)
 
     server.start()
@@ -1076,7 +1123,13 @@ def serve(stop_event: "threading.Event | None" = None) -> None:
                 time.sleep(0.5)
         finally:
             log.info("Vault gRPC stop_event set, stopping server...")
-            server.stop(grace=5)
+            # server.stop() returns a Future; wait for termination to avoid executor shutdown races.
+            fut = server.stop(grace=5)
+            try:
+                fut.wait(timeout=10)
+            except Exception:
+                # best effort
+                pass
             log.info("Vault gRPC server stopped.")
 
 

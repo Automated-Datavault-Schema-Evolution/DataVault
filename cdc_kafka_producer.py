@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from pathlib import Path
 
 import pandas as pd
 import psycopg2
@@ -22,11 +23,40 @@ from utils.schema_helpers import introspect_lake_columns
 WATERMARK_FILE = "/data/state/cdc_watermarks.json"
 WATERMARK_DIR = os.path.dirname(WATERMARK_FILE)
 
+from threading import Lock
+from pyspark.sql import SparkSession
+
+_SPARK: SparkSession | None = None
+_SPARK_LOCK = Lock()
+_SPARK_LISTENER_ADDED = False
+
+
+def _get_spark(app_name: str = "DataVault_CDC_DeltaReader") -> SparkSession:
+    """
+    Parquet/Delta mode needs Spark to read Delta tables.
+    Do NOT call get_spark_session() on every scan; create once and reuse.
+    """
+    global _SPARK, _SPARK_LISTENER_ADDED
+
+    if _SPARK is None:
+        with _SPARK_LOCK:
+            if _SPARK is None:
+                _SPARK = get_spark_session(app_name)
+
+    # Add listener once (optional, keeps your previous behavior)
+    if not _SPARK_LISTENER_ADDED:
+        try:
+            _SPARK.streams.addListener(PerfListener())
+        except Exception:
+            pass
+        _SPARK_LISTENER_ADDED = True
+
+    return _SPARK
+
 
 def build_initial_load_sql(table: str) -> str:
     # Use only real columns from the lake
-    spark = get_spark_session()
-    spark.streams.addListener(PerfListener())
+    spark = _get_spark("DataVault_CDC_SchemaIntrospect")
     cols = introspect_lake_columns(spark, table)  # e.g., ['accountid', ...]
     col_list = ", ".join([f'"{c}"' for c in cols])  # quote for safety
     return f'SELECT {col_list} FROM "{RDBMS_SCHEMA}"."{table}"'
@@ -91,11 +121,72 @@ def check_and_create_topic(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS, topic_name
 
 # Parquet helpers
 def get_parquet_tables():
-    return [f[:-8] for f in os.listdir(PARQUET_PATH) if f.endswith(".parquet")]
+    """
+    In 'parquet' mode, PARQUET_PATH is treated as a Delta Lake root (e.g., /lake):
+      /lake/<table>/_delta_log/...
+    For backward compatibility we also support legacy '<table>.parquet' files in PARQUET_PATH.
+    """
+    root = Path(PARQUET_PATH)
+
+    if not root.exists() or not root.is_dir():
+        log.warning(f"[CDC Producer] PARQUET_PATH not found or not a directory: {root}")
+        return []
+
+    entries = list(root.iterdir())
+
+    # Legacy mode: one file per table
+    parquet_files = [p for p in entries if p.is_file() and p.name.endswith(".parquet")]
+    if parquet_files:
+        return sorted([p.name[:-8] for p in parquet_files])
+
+    # Delta-root mode: directories with _delta_log
+    tables = []
+    for p in entries:
+        if not p.is_dir():
+            continue
+        name = p.name
+        if name.startswith("."):
+            continue
+        if (p / "_delta_log").is_dir():
+            tables.append(name)
+
+    return sorted(tables)
 
 
 def load_parquet_table(table_name):
-    return pd.read_parquet(os.path.join(PARQUET_PATH, table_name + ".parquet"))
+    """
+    Load a table in 'parquet' mode.
+    Supports:
+      (A) legacy: PARQUET_PATH/<table>.parquet
+      (B) delta-root: PARQUET_PATH/<table>/ (directory containing _delta_log)
+    """
+    root = Path(PARQUET_PATH)
+
+    legacy_file = root / f"{table_name}.parquet"
+    if legacy_file.exists() and legacy_file.is_file():
+        return pd.read_parquet(str(legacy_file))
+
+    table_dir = root / str(table_name)
+    if table_dir.exists() and table_dir.is_dir() and (table_dir / "_delta_log").is_dir():
+        # Delta table directory -> read with Spark so we respect the Delta log.
+        try:
+            spark = _get_spark("DataVault_CDC_DeltaReader")
+            sdf = spark.read.format("delta").load(str(table_dir))
+            return sdf.toPandas()
+        except Exception as e:
+            log.warning(f"[CDC Producer] Failed to read delta table '{table_name}' at {table_dir}: {e}")
+            return pd.DataFrame()
+
+    # Fallback: try treating as a parquet dataset directory (pyarrow can read directories)
+    if table_dir.exists() and table_dir.is_dir():
+        try:
+            return pd.read_parquet(str(table_dir))
+        except Exception as e:
+            log.warning(f"[CDC Producer] Failed to read parquet dataset dir '{table_name}' at {table_dir}: {e}")
+            return pd.DataFrame()
+
+    raise FileNotFoundError(f"No parquet/delta table found for '{table_name}' under {root}")
+
 
 
 # RDBMS helpers
@@ -286,6 +377,9 @@ def cdc_producer_insert_only(stop_event=None, skip_full_load_tables=None):
     )
     log.info(f"[CDC Producer] Insert-only CDC from {LAKE_TYPE.upper()} staging area")
     watermarks = load_watermarks()
+
+    if LAKE_TYPE == "parquet":
+        _get_spark("DataVault_CDC_DeltaReader")
 
     stop = stop_event.is_set if stop_event else (lambda: False)
     while not stop():

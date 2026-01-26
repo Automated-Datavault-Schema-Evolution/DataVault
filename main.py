@@ -57,6 +57,18 @@ _DBT_PENDING_LOADED = False
 # Persist pending models so a container restart (fault injection) does not lose queued work.
 _DBT_PENDING_FILE = os.getenv("DBT_PENDING_MODELS_FILE", "/data/state/dbt_pending_models.json")
 
+
+_DBT_PREFLIGHT_SPARK = None
+_DBT_PREFLIGHT_LOCK = threading.Lock()
+
+def _get_dbt_preflight_spark():
+    global _DBT_PREFLIGHT_SPARK
+    if _DBT_PREFLIGHT_SPARK is None:
+        with _DBT_PREFLIGHT_LOCK:
+            if _DBT_PREFLIGHT_SPARK is None:
+                _DBT_PREFLIGHT_SPARK = get_spark_session("DataVault_DBT_Preflight")
+    return _DBT_PREFLIGHT_SPARK
+
 def _load_pending_models_from_disk() -> None:
     """Load pending models once per process start (idempotent)."""
     global _DBT_PENDING_LOADED, _DBT_PENDING_MODELS
@@ -394,43 +406,68 @@ def _preflight_bronze_for_tables(tables: Iterable[str]) -> None:
         return
 
     try:
-        spark = get_spark_session("DataVault_DBT_Preflight")
+        spark = _get_dbt_preflight_spark()
     except Exception as e:
         log.warning(f"[DBT] Spark not available for bronze preflight: {e}")
         return
 
     from pyspark.sql.types import StructType, StructField, StringType
+    import time
+
+    timeout_s = float(os.getenv("DBT_BRONZE_PREFLIGHT_TIMEOUT_S", "120"))
+    poll_s = float(os.getenv("DBT_BRONZE_PREFLIGHT_POLL_S", "2"))
 
     for t in tables:
         tbl = str(t or "").strip().lower()
         if not tbl:
             continue
-        try:
-            cols = bronze_target_columns(spark, tbl) or []
-            if not cols:
-                # Lake not ready / table not discoverable yet; skip preflight for this table.
-                continue
-            schema = StructType([StructField(str(c), StringType(), True) for c in cols])
 
-            # Ensure table is registered as external Delta and enforce missing cols.
-            ensure_bronze_table_exists(spark, tbl, schema)
-            ensure_bronze_table_schema(spark, tbl, schema)
-            # Wait until bronze row count stabilizes (prevents empty/partial raw_vault tables).
-            try:
-                stable_cnt = _wait_bronze_stable_rows(
-                    spark,
-                    STAGING_SCHEMA if "STAGING_SCHEMA" in globals() else "bronze",
-                    tbl,
-                    min_rows=1,
-                    stable_checks=3,
-                    interval_s=2.0,
-                    timeout_s=180.0,
+        # Wait until the lake schema is discoverable (delta table created on first write)
+        deadline = time.time() + timeout_s
+        cols = []
+        logged = False
+
+        while time.time() < deadline:
+            cols = bronze_target_columns(spark, tbl) or []
+            if cols:
+                break
+
+            if not logged:
+                log.info(
+                    f"[DBT] Bronze preflight waiting for lake schema: table={tbl} "
+                    f"(timeout_s={timeout_s}, poll_s={poll_s})"
                 )
-                log.info(f"[DBT] Bronze preflight ready: {tbl} stable_rows={stable_cnt}")
-            except Exception as e:
-                log.warning(f"[DBT] Bronze row-count stability check failed for {tbl}: {e}")
+                logged = True
+
+            time.sleep(poll_s)
+
+        if not cols:
+            # Do NOT continue into dbt; that will fail with a cryptic TABLE_OR_VIEW_NOT_FOUND.
+            raise RuntimeError(
+                f"[DBT] Bronze preflight timed out waiting for lake schema for '{tbl}' "
+                f"(timeout_s={timeout_s}). Refusing to run dbt because bronze.{tbl} would be missing."
+            )
+
+        schema = StructType([StructField(str(c), StringType(), True) for c in cols])
+
+        # Ensure table is registered as external Delta and enforce missing cols.
+        ensure_bronze_table_exists(spark, tbl, schema)
+        ensure_bronze_table_schema(spark, tbl, schema)
+
+        # Wait until bronze row count stabilizes (prevents empty/partial raw_vault tables).
+        try:
+            stable_cnt = _wait_bronze_stable_rows(
+                spark,
+                STAGING_SCHEMA if "STAGING_SCHEMA" in globals() else "bronze",
+                tbl,
+                min_rows=1,
+                stable_checks=3,
+                interval_s=2.0,
+                timeout_s=180.0,
+            )
+            log.info(f"[DBT] Bronze preflight ready: {tbl} stable_rows={stable_cnt}")
         except Exception as e:
-            log.warning(f"[DBT] Bronze preflight failed for {tbl}: {e}")
+            log.warning(f"[DBT] Bronze row-count stability check failed for {tbl}: {e}")
 
 def run_dbt_models(models):
     """Run dbt for the specified models."""
@@ -439,7 +476,8 @@ def run_dbt_models(models):
 
     ensure_profiles_dir()
 
-    schema_path = os.path.join(os.path.dirname(__file__), "models", "schema.yml")
+    base_dir = os.path.dirname(globals().get("__file__", os.getcwd()))
+    schema_path = os.path.join(base_dir, "models", "schema.yml")
 
     referenced_tables = set()
     for m in models:
@@ -814,14 +852,33 @@ def discover_lake():
             log.warning(f"[discover_lake] Fallback parquet schema failed for {table_dir}: {e}")
         return None
 
-    # Discover delta tables in root
+    # Discover delta tables in root (case-insensitive keys).
     table_dirs = [p for p in lake_root.iterdir() if _is_delta_table_dir(p)]
-    tables = sorted([p.name for p in table_dirs])
+    dir_by_key = {p.name.lower(): p for p in table_dirs}
+    tables = sorted(dir_by_key.keys())
+
+    def _normalize_table_key(name: str) -> str:
+        name = (name or "").strip()
+        if "." in name:
+            name = name.split(".", 1)[-1]
+        return name.lower()
 
     def load_table(table_name: str) -> pd.DataFrame:
-        table_dir = lake_root / table_name
-        if not _is_delta_table_dir(table_dir):
-            log.warning(f"[discover_lake] Table not found or not a delta table: {table_dir}")
+        key = _normalize_table_key(table_name)
+        table_dir = dir_by_key.get(key)
+
+        if table_dir is None:
+            # last resort: scan (covers unexpected casing / odd characters)
+            for p in table_dirs:
+                if p.name.lower() == key:
+                    table_dir = p
+                    break
+
+        if table_dir is None or not _is_delta_table_dir(table_dir):
+            log.warning(
+                f"[discover_lake] Table not found or not a delta table: requested={table_name!r} "
+                f"(key={key!r}) under root={lake_root}"
+            )
             return pd.DataFrame()
 
         cols = _schema_from_delta_log(table_dir)
@@ -834,7 +891,6 @@ def discover_lake():
         return pd.DataFrame(columns=cols)
 
     return tables, load_table
-
 
 
 def ensure_database_schema():
@@ -859,7 +915,7 @@ def ensure_database_schema():
 
     # Map known schemas to their base paths
     schema_locations = {
-        STAGING_SCHEMA: RAW_VAULT_BASE_PATH,
+        STAGING_SCHEMA: STAGING_BASE_PATH,
         RAW_VAULT_SCHEMA: RAW_VAULT_BASE_PATH,
     }
     desired_loc = schema_locations.get(schema)
@@ -1443,13 +1499,17 @@ def main():
                     # this lake table is missing at least one DV object -> full load needed
                     tables_needing_initial_load.add(table)
 
-        if models_to_run:
-            log.info(f"[DBT] Will run for: {sorted(models_to_run)}")
-            # Create raw_vault objects up-front (first run); later runs will also be triggered by streaming callback
-            run_dbt_models(sorted(models_to_run))
-
         # Start the debounced DBT runner (coalesces per-batch model requests)
         start_dbt_debouncer()
+
+        if models_to_run:
+            # Queue instead of blocking startup; debouncer will run them.
+            initial = sorted(models_to_run)
+            log.info("[DBT] Queueing initial models for debounced run (count=%s).", len(initial))
+            queue_dbt_models(initial)
+        else:
+            log.info("[DBT] No eligible models to run (or dbt missing).")
+
 
         # -------- Phase 1: Kafka readiness + topic ensure --------
         check_and_create_topic()  # make sure topic exists before streams/producers

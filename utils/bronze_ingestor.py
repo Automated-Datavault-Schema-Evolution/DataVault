@@ -361,7 +361,8 @@ def start_bronze_writer(
             .saveAsTable(target)
         )
 
-        written = out.count()
+        # written = out.count()
+        written = tdf_raw.count()
         log.info("[BRONZE][%s][batch=%s] written=%s", tbl, batch_id, written)
         return written
 
