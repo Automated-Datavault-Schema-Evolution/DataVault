@@ -283,7 +283,7 @@ def produce_tables_once(tables):
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         linger_ms=0,
-        acks='all'
+        acks="all"
     )
 
     if LAKE_TYPE == "parquet":
@@ -294,10 +294,22 @@ def produce_tables_once(tables):
         log.critical(f"Unknown LAKE_TYPE '{LAKE_TYPE}' (must be 'parquet' or 'rdbms')")
         raise ValueError("Unknown LAKE_TYPE (must be 'parquet' or 'rdbms')")
 
+    # Always load persisted watermarks so an "initial load" is truly once across restarts/reruns.
     watermarks = load_watermarks()
+    log.info(f"[CDC Producer] Starting produce_tables_once with {len(watermarks)} existing watermark(s)")
     produced_counts: dict[str, int] = {}
 
+    # Limit in-flight futures so we don't accumulate huge lists for large tables.
+    FUTURE_BATCH = 1000
+
     for table in tables:
+        # --- FIX: Skip initial load if we already have a valid watermark for this table ---
+        existing_wm = watermarks.get(table)
+        if existing_wm is not None and not pd.isna(existing_wm):
+            log.info(f"[CDC Producer] Skipping initial load for {table}: existing watermark {existing_wm}")
+            produced_counts[table] = 0
+            continue
+
         log.info(f"[CDC Producer] Initial load for {table}")
         try:
             df = load_func(table)
@@ -328,18 +340,26 @@ def produce_tables_once(tables):
 
             payload["ingestion_timestamp"] = ingestion_timestamp
 
-            futures.append(producer.send(
-                KAFKA_TOPIC,
-                {
-                    "table": table,
-                    "payload": json.dumps(payload, default=str),
-                    "cdc_type": "insert",
-                    "cdc_ingestion_timestamp": ingestion_timestamp,
-                },
-            ))
+            futures.append(
+                producer.send(
+                    KAFKA_TOPIC,
+                    {
+                        "table": table,
+                        "payload": json.dumps(payload, default=str),
+                        "cdc_type": "insert",
+                        "cdc_ingestion_timestamp": ingestion_timestamp,
+                    },
+                )
+            )
             cnt += 1
 
-        # wait once, after all sends (surface delivery errors)
+            # Drain futures in batches to avoid unbounded memory growth.
+            if len(futures) >= FUTURE_BATCH:
+                for fut in futures:
+                    fut.get(timeout=30)
+                futures.clear()
+
+        # Wait for remaining sends (surface delivery errors)
         for fut in futures:
             fut.get(timeout=30)
 
@@ -348,16 +368,21 @@ def produce_tables_once(tables):
             max_ts = pd.to_datetime(df["ingestion_timestamp"], errors="coerce", utc=True).max()
             watermarks[table] = max_ts
             log.info(f"[CDC Producer] Produced {cnt} events for {table}. Watermark: {watermarks.get(table)}")
+
+            # --- FIX: Persist watermark immediately after a successful initial load ---
+            save_watermarks(watermarks)
         else:
             log.info(f"[CDC Producer] Produced 0 events for {table}.")
 
         produced_counts[table] = cnt
 
     producer.flush()
+    # Persist once more at the end (cheap insurance)
     save_watermarks(watermarks)
     producer.close()
 
     return produced_counts
+
 
 
 def cdc_producer_insert_only(stop_event=None, skip_full_load_tables=None):
