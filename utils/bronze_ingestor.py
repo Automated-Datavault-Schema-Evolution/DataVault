@@ -57,7 +57,7 @@ def ensure_bronze_table_schema(spark: SparkSession, table_name: str, df_schema: 
     try:
         have_cols = {f.name.lower() for f in spark.table(fqtn).schema.fields}
     except Exception as e:
-        log.warning("[BRONZE] Could not read existing schema for %s: %s", fqtn, e)
+        log.warning(f"[DVH_UTILS][BRONZE] Could not read existing schema for {fqtn}: {e}")
         return
 
     missing = [f for f in df_schema.fields if f.name.lower() not in have_cols]
@@ -65,7 +65,7 @@ def ensure_bronze_table_schema(spark: SparkSession, table_name: str, df_schema: 
         return
 
     cols_sql = ", ".join(f"`{f.name}` {_spark_sql_type(f.dataType)}" for f in missing)
-    log.info("[BRONZE] Adding missing columns to %s: %s", fqtn, [f.name for f in missing])
+    log.info(f"[DVH_UTILS][BRONZE] Adding missing columns to {fqtn}: {[f.name for f in missing]}")
     spark.sql(f"ALTER TABLE {fqtn} ADD COLUMNS ({cols_sql})")
 
 
@@ -95,7 +95,7 @@ def ensure_bronze_table_matches_lake(spark: SparkSession, table_name: str) -> No
     try:
         cols = bronze_target_columns(spark, table_name)  # lake schema if table not exists, else bronze schema
     except Exception as e:
-        log.warning("[BRONZE] Could not determine lake/bronze target columns for %s: %s", table_name, e)
+        log.warning(f"[DVH_UTILS][BRONZE] Could not determine lake/bronze target columns for {table_name}: {e}")
         cols = []
 
     if not cols:
@@ -152,24 +152,24 @@ def ensure_bronze_table_exists(spark: SparkSession, table_name: str, schema: T.S
 
     # Not registered yet → decide based on LOCATION content
     if not spark.catalog.tableExists(fq):
-        log.info("[BRONZE] Creating external Delta table: %s at %s", fq, table_dir)
+        log.info(f"[DVH_UTILS][BRONZE] Creating external Delta table: {fq} at {table_dir}")
 
         if _is_delta_dir(table_dir):
             spark.sql(f"CREATE TABLE {fq} USING DELTA LOCATION '{str(table_dir)}'")
-            log.info("[BRONZE] Registered existing Delta at %s as %s", table_dir, fq)
+            log.info(f"[DVH_UTILS][BRONZE] Registered existing Delta at {table_dir} as {fq}")
             ensure_bronze_table_schema(spark, table_name, schema)
             return True
 
         if _has_parquet_files(table_dir):
             spark.sql(f"CONVERT TO DELTA parquet.`{str(table_dir)}`")
             spark.sql(f"CREATE TABLE {fq} USING DELTA LOCATION '{str(table_dir)}'")
-            log.info("[BRONZE] Converted Parquet at %s to Delta, registered %s", table_dir, fq)
+            log.info(f"[DVH_UTILS][BRONZE] Converted Parquet at {table_dir} to Delta, registered {fq}")
             ensure_bronze_table_schema(spark, table_name, schema)
             return True
 
         # Empty directory → create brand new Delta table with schema
         spark.sql(_ddl_for_external(schema))
-        log.info("[BRONZE] Precreated empty table %s", fq)
+        log.info(f"[DVH_UTILS][BRONZE] Precreated empty table {fq}")
         return True
 
     # Table exists: verify format
@@ -185,16 +185,16 @@ def ensure_bronze_table_exists(spark: SparkSession, table_name: str, schema: T.S
         ensure_bronze_table_schema(spark, table_name, schema)
         return False
 
-    log.warning("[BRONZE] Existing table %s is %s; attempting to convert/register", fq, fmt)
+    log.warning(f"[DVH_UTILS][BRONZE] Existing table {fq} is {fmt}; attempting to convert/register")
 
     # Try in-place by table name
     try:
         spark.sql(f"CONVERT TO DELTA {fq}")
-        log.info("[BRONZE] Converted %s to Delta in place", fq)
+        log.info(f"[DVH_UTILS][BRONZE] Converted {fq} to Delta in place")
         ensure_bronze_table_schema(spark, table_name, schema)
         return True
     except Exception as e:
-        log.warning("[BRONZE] In-place CONVERT TO DELTA failed for %s: %s", fq, e)
+        log.warning(f"[DVH_UTILS][BRONZE] In-place CONVERT TO DELTA failed for {fq}: {e}")
 
     # Fallback via path
     target_path = Path(loc) if loc else table_dir
@@ -202,7 +202,7 @@ def ensure_bronze_table_exists(spark: SparkSession, table_name: str, schema: T.S
     if _is_delta_dir(target_path):
         spark.sql(f"DROP TABLE IF EXISTS {fq}")
         spark.sql(f"CREATE TABLE {fq} USING DELTA LOCATION '{str(target_path)}'")
-        log.info("[BRONZE] Re-registered existing Delta at %s as %s", target_path, fq)
+        log.info(f"[DVH_UTILS][BRONZE] Re-registered existing Delta at {target_path} as {fq}")
         ensure_bronze_table_schema(spark, table_name, schema)
         return True
 
@@ -210,7 +210,7 @@ def ensure_bronze_table_exists(spark: SparkSession, table_name: str, schema: T.S
         spark.sql(f"CONVERT TO DELTA parquet.`{str(target_path)}`")
         spark.sql(f"DROP TABLE IF EXISTS {fq}")
         spark.sql(f"CREATE TABLE {fq} USING DELTA LOCATION '{str(target_path)}'")
-        log.info("[BRONZE] Converted Parquet at %s to Delta and re-registered %s", target_path, fq)
+        log.info(f"[DVH_UTILS][BRONZE] Converted Parquet at {target_path} to Delta and re-registered {fq}")
         ensure_bronze_table_schema(spark, table_name, schema)
         return True
 
@@ -223,7 +223,7 @@ def ensure_bronze_table_exists(spark: SparkSession, table_name: str, schema: T.S
             f"CREATE TABLE {fq} ({cols_sql}) USING DELTA LOCATION '{str(target_path)}' "
             "TBLPROPERTIES (delta.autoOptimize.optimizeWrite=true, delta.autoOptimize.autoCompact=true)"
         )
-        log.info("[BRONZE] Recreated %s as external Delta at %s", fq, target_path)
+        log.info(f"[DVH_UTILS][BRONZE] Recreated {fq} as external Delta at {target_path}")
         return True
 
     raise RuntimeError(
@@ -244,10 +244,10 @@ def truncate_bronze_table(spark: SparkSession, table_name: str) -> None:
 
     fq = f"{STAGING_SCHEMA}.{table_name}"
     if not spark.catalog.tableExists(fq):
-        log.info("[BRONZE] Table %s not found; skipping truncate", fq)
+        log.info(f"[DVH_UTILS][BRONZE] Table {fq} not found; skipping truncate")
         return
     spark.sql(f"TRUNCATE TABLE {fq}")
-    log.info("[BRONZE] Truncated %s", fq)
+    log.info(f"[DVH_UTILS][BRONZE] Truncated {fq}")
 
 
 def start_bronze_writer(
@@ -269,7 +269,7 @@ def start_bronze_writer(
     checkpoint_base = checkpoint_base or os.environ.get("CHECKPOINT_PATH", "/data/checkpoints")
 
     if df_stream is None:
-        log.warning("[BRONZE] No stream; skipping writer")
+        log.warning("[DVH_UTILS][BRONZE] No stream; skipping writer")
         return None
     _ensure_db(spark)
 
@@ -296,21 +296,21 @@ def start_bronze_writer(
                         present[f.name.lower()] = f.name
                 return out.select(*tgt_cols)
         except Exception as e:
-            log.debug("[BRONZE] alignment skipped for %s: %s", target_table, e)
+            log.debug(f"[DVH_UTILS][BRONZE] alignment skipped for {target_table}: {e}")
         return df
 
     def _write_one_table(tbl: str, tdf_raw: "DataFrame", batch_id: int) -> int:
         tbl = str(tbl or "").strip().lower()
         if not tbl:
-            log.info("[BRONZE][batch=%s] empty table name; skipping", batch_id)
+            log.info(f"[DVH_UTILS][BRONZE][batch={batch_id}] empty table name; skipping")
             return 0
         if tdf_raw.rdd.isEmpty():
-            log.debug("[BRONZE][%s][batch=%s] empty slice", tbl, batch_id)
+            log.debug(f"[DVH_UTILS][BRONZE][{tbl}][batch={batch_id}] empty slice")
             return 0
 
         sample = tdf_raw.select("payload").where(F.col("payload").isNotNull()).limit(1).collect()
         if not sample:
-            log.info("[BRONZE][%s][batch=%s] no sample payload; skipping", tbl, batch_id)
+            log.info(f"[DVH_UTILS][BRONZE][{tbl}][batch={batch_id}] no sample payload; skipping")
             return 0
 
         payload_cols = _infer_payload_keys(sample[0]["payload"])
@@ -320,7 +320,7 @@ def start_bronze_writer(
         try:
             lake_cols = [c.lower() for c in bronze_target_columns(spark, tbl)]
         except Exception as e:
-            log.debug("[BRONZE][%s] bronze_target_columns failed: %s", tbl, e)
+            log.debug(f"[DVH_UTILS][BRONZE][{tbl}] bronze_target_columns failed: {e}")
 
         merged_cols = []
         for c in lake_cols + payload_cols:
@@ -333,7 +333,7 @@ def start_bronze_writer(
         if not merged_cols:
             schema = infer_schema_from_cdc_event(spark, tbl)
             if not schema:
-                log.info("[BRONZE][%s][batch=%s] no schema available; skipping", tbl, batch_id)
+                log.info(f"[DVH_UTILS][BRONZE][{tbl}][batch={batch_id}] no schema available; skipping")
                 return 0
 
         # Ensure table exists and schema is enforced
@@ -363,7 +363,7 @@ def start_bronze_writer(
 
         # written = out.count()
         written = tdf_raw.count()
-        log.info("[BRONZE][%s][batch=%s] written=%s", tbl, batch_id, written)
+        log.info(f"[DVH_UTILS][BRONZE][{tbl}][batch={batch_id}] written={written}")
         return written
 
     # Single-table mode
@@ -381,7 +381,7 @@ def start_bronze_writer(
                         touched = [table_name] if written > 0 else []
                         on_after_write(touched, batch_id, {table_name: written} if written > 0 else {})
                     except Exception as e:
-                        log.warning("[BRONZE] on_after_write failed for batch %s: %s", batch_id, e)
+                        log.warning(f"[DVH_UTILS][BRONZE] on_after_write failed for batch {batch_id}: {e}")
             finally:
                 bdf.unpersist(blocking=False)
 
@@ -409,13 +409,13 @@ def start_bronze_writer(
 
     def _multi(batch_df: "DataFrame", batch_id: int):
         if batch_df.rdd.isEmpty():
-            log.debug("[BRONZE][batch=%s] Empty micro-batch", batch_id)
+            log.debug(f"[DVH_UTILS][BRONZE][batch={batch_id}] Empty micro-batch")
             return
 
         required = {"table", "payload", "cdc_type", "cdc_modified_at"}
         missing = required - set(batch_df.columns)
         if missing:
-            log.warning("[BRONZE][batch=%s] Missing expected columns: %s", batch_id, sorted(missing))
+            log.warning(f"[DVH_UTILS][BRONZE][batch={batch_id}] Missing expected columns: {sorted(missing)}")
             return
 
         bdf = (
@@ -446,13 +446,13 @@ def start_bronze_writer(
                 finally:
                     slice_df.unpersist(blocking=False)
 
-            log.info("[BRONZE][batch=%s] tables=%d total_rows=%d", batch_id, len(tables), total)
+            log.info(f"[DVH_UTILS][BRONZE][batch={batch_id}] tables={len(tables)} total_rows={total}")
 
             if on_after_write:
                 try:
                     on_after_write(touched, batch_id, per_table_counts)
                 except Exception as e:
-                    log.warning("[BRONZE] on_after_write failed for batch %s: %s", batch_id, e)
+                    log.warning(f"[DVH_UTILS][BRONZE] on_after_write failed for batch {batch_id}: {e}")
         finally:
             bdf.unpersist(blocking=False)
 

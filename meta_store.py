@@ -53,7 +53,7 @@ def _append_parquet(row, path):
                 df = pd.concat([df_existing, row], ignore_index=True)
             except Exception as exc:
                 # If file is corrupt/half-written, overwrite with the new row rather than failing every retry
-                log.warning(f"[META] Failed reading existing parquet {path!r}: {exc}; overwriting.")
+                log.warning(f"[DVH][META] Failed reading existing parquet {path!r}: {exc}; overwriting.")
                 df = row
         else:
             df = row

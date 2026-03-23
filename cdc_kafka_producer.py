@@ -16,7 +16,7 @@ from config import (
     RDBMS_HOST, RDBMS_PORT, RDBMS_DB, RDBMS_USER, RDBMS_PASSWORD, RDBMS_SCHEMA,
     KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, KAFKA_PARTITIONS, KAFKA_REPLICATION,
 )
-from utils.helper_spark import get_spark_session
+from helper.spark_helper import get_spark_session
 from utils.performance_logger import PerfListener
 from utils.schema_helpers import introspect_lake_columns
 
@@ -71,7 +71,7 @@ def check_and_create_topic(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS, topic_name
     admin = KafkaAdminClient(bootstrap_servers=bootstrap_servers)
     topics = admin.list_topics()
     if topic_name in topics:
-        log.debug(f"[Kafka] Topic '{topic_name}' already exists.")
+        log.debug(f"[DVH][Kafka] Topic '{topic_name}' already exists.")
         # ensure it has at least num_partitions
         try:
             prod = KafkaProducer(bootstrap_servers=bootstrap_servers)
@@ -83,19 +83,19 @@ def check_and_create_topic(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS, topic_name
 
         if cur_cnt < num_partitions:
             try:
-                log.warning(f"[Kafka] Increasing partitions for '{topic_name}' from {cur_cnt} to {num_partitions}")
+                log.warning(f"[DVH][Kafka] Increasing partitions for '{topic_name}' from {cur_cnt} to {num_partitions}")
                 admin.create_partitions({topic_name: NewPartitions(total_count=num_partitions)})
             except Exception as e:
-                log.error(f"[Kafka] Could not increase partitions: {e}")
+                log.error(f"[DVH][Kafka] Could not increase partitions: {e}")
 
     else:
-        log.warning(f"[Kafka] Topic '{topic_name}' does not exist. Creating...")
+        log.warning(f"[DVH][Kafka] Topic '{topic_name}' does not exist. Creating...")
         topic = NewTopic(name=topic_name, num_partitions=num_partitions, replication_factor=replication_factor)
         try:
             admin.create_topics([topic])
-            log.info(f"[Kafka] Topic '{topic_name}' created.")
+            log.info(f"[DVH][Kafka] Topic '{topic_name}' created.")
         except TopicAlreadyExistsError:
-            log.error(f"[Kafka] Topic '{topic_name}' already created by another process.")
+            log.error(f"[DVH][Kafka] Topic '{topic_name}' already created by another process.")
     admin.close()
 
     # Wait until at least one partition is assigned to the topic
@@ -106,15 +106,15 @@ def check_and_create_topic(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS, topic_name
             partitions = producer.partitions_for(topic_name)
             producer.close()
             if partitions and len(partitions) > 0:
-                log.debug(f"[Kafka] Topic '{topic_name}' is available with {len(partitions)} partition(s).")
+                log.debug(f"[DVH][Kafka] Topic '{topic_name}' is available with {len(partitions)} partition(s).")
                 break
             else:
-                log.debug(f"[Kafka] Waiting for partitions for topic '{topic_name}'...")
+                log.debug(f"[DVH][Kafka] Waiting for partitions for topic '{topic_name}'...")
         except Exception as e:
-            log.error(f"[Kafka] Waiting for topic '{topic_name}'... ({e})")
+            log.error(f"[DVH][Kafka] Waiting for topic '{topic_name}'... ({e})")
         time.sleep(1)
         if time.time() - start > timeout_sec:
-            log.critical(f"[Kafka] Timeout: Topic '{topic_name}' does not have partitions after {timeout_sec} seconds.")
+            log.critical(f"[DVH][Kafka] Timeout: Topic '{topic_name}' does not have partitions after {timeout_sec} seconds.")
             raise TimeoutError(
                 f"[Kafka] Timeout: Topic '{topic_name}' does not have partitions after {timeout_sec} seconds.")
 
@@ -129,7 +129,7 @@ def get_parquet_tables():
     root = Path(PARQUET_PATH)
 
     if not root.exists() or not root.is_dir():
-        log.warning(f"[CDC Producer] PARQUET_PATH not found or not a directory: {root}")
+        log.warning(f"[DVH][CDC Producer] PARQUET_PATH not found or not a directory: {root}")
         return []
 
     entries = list(root.iterdir())
@@ -174,7 +174,7 @@ def load_parquet_table(table_name):
             sdf = spark.read.format("delta").load(str(table_dir))
             return sdf.toPandas()
         except Exception as e:
-            log.warning(f"[CDC Producer] Failed to read delta table '{table_name}' at {table_dir}: {e}")
+            log.warning(f"[DVH][CDC Producer] Failed to read delta table '{table_name}' at {table_dir}: {e}")
             return pd.DataFrame()
 
     # Fallback: try treating as a parquet dataset directory (pyarrow can read directories)
@@ -182,7 +182,7 @@ def load_parquet_table(table_name):
         try:
             return pd.read_parquet(str(table_dir))
         except Exception as e:
-            log.warning(f"[CDC Producer] Failed to read parquet dataset dir '{table_name}' at {table_dir}: {e}")
+            log.warning(f"[DVH][CDC Producer] Failed to read parquet dataset dir '{table_name}' at {table_dir}: {e}")
             return pd.DataFrame()
 
     raise FileNotFoundError(f"No parquet/delta table found for '{table_name}' under {root}")
@@ -296,7 +296,7 @@ def produce_tables_once(tables):
 
     # Always load persisted watermarks so an "initial load" is truly once across restarts/reruns.
     watermarks = load_watermarks()
-    log.info(f"[CDC Producer] Starting produce_tables_once with {len(watermarks)} existing watermark(s)")
+    log.info(f"[DVH][CDC Producer] Starting produce_tables_once with {len(watermarks)} existing watermark(s)")
     produced_counts: dict[str, int] = {}
 
     # Limit in-flight futures so we don't accumulate huge lists for large tables.
@@ -306,11 +306,11 @@ def produce_tables_once(tables):
         # --- FIX: Skip initial load if we already have a valid watermark for this table ---
         existing_wm = watermarks.get(table)
         if existing_wm is not None and not pd.isna(existing_wm):
-            log.info(f"[CDC Producer] Skipping initial load for {table}: existing watermark {existing_wm}")
+            log.info(f"[DVH][CDC Producer] Skipping initial load for {table}: existing watermark {existing_wm}")
             produced_counts[table] = 0
             continue
 
-        log.info(f"[CDC Producer] Initial load for {table}")
+        log.info(f"[DVH][CDC Producer] Initial load for {table}")
         try:
             df = load_func(table)
         except Exception as e:
@@ -367,12 +367,12 @@ def produce_tables_once(tables):
             # df['ingestion_timestamp'] may be mixed types; let pandas compute max then normalize
             max_ts = pd.to_datetime(df["ingestion_timestamp"], errors="coerce", utc=True).max()
             watermarks[table] = max_ts
-            log.info(f"[CDC Producer] Produced {cnt} events for {table}. Watermark: {watermarks.get(table)}")
+            log.info(f"[DVH][CDC Producer] Produced {cnt} events for {table}. Watermark: {watermarks.get(table)}")
 
             # --- FIX: Persist watermark immediately after a successful initial load ---
             save_watermarks(watermarks)
         else:
-            log.info(f"[CDC Producer] Produced 0 events for {table}.")
+            log.info(f"[DVH][CDC Producer] Produced 0 events for {table}.")
 
         produced_counts[table] = cnt
 
@@ -400,7 +400,7 @@ def cdc_producer_insert_only(stop_event=None, skip_full_load_tables=None):
         linger_ms=100,
         acks='all'
     )
-    log.info(f"[CDC Producer] Insert-only CDC from {LAKE_TYPE.upper()} staging area")
+    log.info(f"[DVH][CDC Producer] Insert-only CDC from {LAKE_TYPE.upper()} staging area")
     watermarks = load_watermarks()
 
     if LAKE_TYPE == "parquet":
@@ -419,7 +419,7 @@ def cdc_producer_insert_only(stop_event=None, skip_full_load_tables=None):
             raise ValueError("Unknown LAKE_TYPE (must be 'parquet' or 'rdbms')")
 
         for table in tables:
-            log.info(f"[CDC Producer] Scanning {table}")
+            log.info(f"[DVH][CDC Producer] Scanning {table}")
             try:
                 df = load_func(table)
             except Exception as e:
@@ -468,7 +468,7 @@ def cdc_producer_insert_only(stop_event=None, skip_full_load_tables=None):
 
             max_ts = pd.to_datetime(new_rows["ingestion_timestamp"], errors="coerce", utc=True).max()
             watermarks[table] = max_ts
-            log.info(f"[CDC Producer] Produced {len(new_rows)} events for {table}. Watermark: {max_ts}")
+            log.info(f"[DVH][CDC Producer] Produced {len(new_rows)} events for {table}. Watermark: {max_ts}")
 
         producer.flush()
         save_watermarks(watermarks)

@@ -25,14 +25,14 @@ def stop_streaming_query(q) -> None:
         return
     try:
         if q.isActive:
-            log.info("[STREAM][control] stopping streaming query %s", getattr(q, "name", q.id))
+            log.info(f'[DVH_UTILS][STREAM][control] stopping streaming query {getattr(q, "name", q.id)}')
             q.stop()  # graceful: finishes current micro-batch
             # wait until inactive
             t0 = time.time()
             while q.isActive and (time.time() - t0) < 120:
                 time.sleep(0.5)
     except Exception as e:
-        log.debug("[STREAM][control] stop skipped: %s", e)
+        log.debug(f"[DVH_UTILS][STREAM][control] stop skipped: {e}")
 
 
 def maintenance_watchdog(query_holder, start_fn, start_args):
@@ -51,7 +51,7 @@ def maintenance_watchdog(query_holder, start_fn, start_args):
                     stop_streaming_query(query_holder.get("q"))
                     query_holder["q"] = None
                     _write_status("PAUSED")
-                    log.info("[MAINT] Stream paused; safe to prune Bronze tables now.")
+                    log.info("[DVH_UTILS][MAINT] Stream paused; safe to prune Bronze tables now.")
                 # wait here until flag removed
                 time.sleep(1.0)
                 continue
@@ -59,10 +59,10 @@ def maintenance_watchdog(query_holder, start_fn, start_args):
             # flag not present -> ensure running
             if _read_status() != "RUNNING":
                 # restart stream
-                log.info("[MAINT] Resuming streaming consumer.")
+                log.info("[DVH_UTILS][MAINT] Resuming streaming consumer.")
                 query_holder["q"] = start_fn(*start_args)
                 _write_status("RUNNING")
             time.sleep(2.0)
         except Exception as e:
-            log.debug("[MAINT] watchdog loop: %s", e)
+            log.debug(f"[DVH_UTILS][MAINT] watchdog loop: {e}")
             time.sleep(2.0)

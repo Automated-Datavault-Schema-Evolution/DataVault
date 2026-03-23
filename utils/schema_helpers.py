@@ -1,7 +1,10 @@
+"""Schema inspection helpers for bronze and lake reconciliation."""
+
 import json
 import os
 from typing import List
 
+from domain.table_identity import physical_rdbms_table_name
 from logger import log
 from pyspark.sql import SparkSession, functions as F
 
@@ -21,6 +24,7 @@ def _jdbc_props() -> dict:
 def _escape_sql_literal(s: str) -> str:
     return s.replace("'", "''")
 
+
 def introspect_lake_columns(spark: SparkSession, table: str) -> List[str]:
     """
     Canonical column list for a lake table (order stable).
@@ -31,7 +35,9 @@ def introspect_lake_columns(spark: SparkSession, table: str) -> List[str]:
     """
     if LAKE_TYPE == "rdbms":
         schema_esc = _escape_sql_literal(RDBMS_SCHEMA)
-        table_esc = _escape_sql_literal(table)
+        logical_table = str(table or "").strip()
+        physical_table = physical_rdbms_table_name(logical_table)
+        table_esc = _escape_sql_literal(physical_table)
 
         query = (
             "(SELECT column_name "
@@ -43,7 +49,9 @@ def introspect_lake_columns(spark: SparkSession, table: str) -> List[str]:
 
         df = spark.read.jdbc(url=_jdbc_url(), table=query, properties=_jdbc_props())
         cols = [r["column_name"].lower() for r in df.collect()]
-        log.debug(f"[Schema] RDBMS columns for {table}: {cols}")
+        log.debug(
+            f"[DVH_UTILS][Schema] RDBMS columns for logical={logical_table} physical={physical_table}: {cols}"
+        )
         return cols
 
     if LAKE_TYPE == "parquet":
@@ -90,10 +98,10 @@ def introspect_lake_columns(spark: SparkSession, table: str) -> List[str]:
             if delta_dir:
                 df0 = spark.read.format("delta").load(delta_dir).limit(0)
                 cols = [c.lower() for c in df0.columns]
-                log.debug(f"[Schema] Delta columns for {table}: {cols}")
+                log.debug(f"[DVH_UTILS][Schema] Delta columns for {table}: {cols}")
                 return cols
         except Exception as e:
-            log.debug(f"[Schema] Delta introspection failed for {table} at {delta_dir}: {e}")
+            log.debug(f"[DVH_UTILS][Schema] Delta introspection failed for {table} at {delta_dir}: {e}")
 
         # 2) Fallback: plain parquet file <PARQUET_PATH>/<table>.parquet
         parquet_file = _resolve_parquet_file(PARQUET_PATH, str(table))
@@ -101,7 +109,7 @@ def introspect_lake_columns(spark: SparkSession, table: str) -> List[str]:
             return []
         df0 = spark.read.parquet(parquet_file).limit(0)
         cols = [c.lower() for c in df0.columns]
-        log.debug(f"[Schema] Parquet columns for {table}: {cols}")
+        log.debug(f"[DVH_UTILS][Schema] Parquet columns for {table}: {cols}")
         return cols
 
     raise ValueError(f"Unsupported LAKE_TYPE: {LAKE_TYPE}")
@@ -128,13 +136,13 @@ def bronze_target_columns(spark: SparkSession, table: str) -> List[str]:
         if spark.catalog.tableExists(fq):
             existing_cols = [f.name for f in spark.table(fq).schema.fields]
     except Exception as e:
-        log.debug(f"[Schema] Could not introspect existing {fq}: {e}")
+        log.debug(f"[DVH_UTILS][Schema] Could not introspect existing {fq}: {e}")
 
     lake_cols: List[str] = []
     try:
         lake_cols = introspect_lake_columns(spark, table) or []
     except Exception as e:
-        log.debug(f"[Schema] Could not introspect lake columns for {table}: {e}")
+        log.debug(f"[DVH_UTILS][Schema] Could not introspect lake columns for {table}: {e}")
 
     merged: List[str] = []
     for c in lake_cols + existing_cols:
@@ -145,7 +153,7 @@ def bronze_target_columns(spark: SparkSession, table: str) -> List[str]:
             merged.append(c)
 
     log.info(
-        f"[Schema] bronze_target_columns({table}) -> {merged} "
+        f"[DVH_UTILS][Schema] bronze_target_columns({table}) -> {merged} "
         f"(lake={len(lake_cols)} existing={len(existing_cols)})"
     )
     return merged

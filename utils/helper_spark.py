@@ -27,8 +27,12 @@ from config import (
 )
 
 
-# TODO: REFACTOR!! --> EITHER DELETE AND ONLY RUN IN DOCKER, OR CHANGE LOGIC FOR DYNAMIC PATHS IN env-file
+# Warehouse dir selection supports explicit overrides via SPARK_SQL_WAREHOUSE_DIR / SPARK_WAREHOUSE_DIR.
 def _pick_warehouse_dir() -> Path:
+    override = os.getenv("SPARK_SQL_WAREHOUSE_DIR") or os.getenv("SPARK_WAREHOUSE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+
     is_local = str(SPARK_MASTER).startswith("local") and os.getenv("ENV_TYPE", "local") == "local"
     base = HOST_SPARK_WAREHOUSE_DIR if is_local else CONTAINER_WAREHOUSE_DIR
     return Path(base).resolve()
@@ -37,6 +41,7 @@ def _pick_warehouse_dir() -> Path:
 def ensure_spark_warehouse_dir():
     """Ensure Spark's warehouse dir exists and is writable."""
     path = _pick_warehouse_dir()
+    path.mkdir(parents=True, exist_ok=True)
     # Best-effort perms; do NOT fail if EPERM on bind mounts
     try:
         path.chmod(0o775)
@@ -130,11 +135,11 @@ def get_spark_session(app_name="Kafka_Consumer_Lake_Handler"):
     ]
     existing_jars = [p for p in requested_jars if os.path.exists(p)]
     for p in requested_jars:
-        log.info(f"[JAR_CHECK] {p} exists={os.path.exists(p)}")
+        log.info(f"[DVH_UTILS][JAR_CHECK] {p} exists={os.path.exists(p)}")
     if existing_jars:
         builder = builder.config("spark.jars", ",".join(existing_jars))
     else:
-        log.warning("[JAR_CHECK] None of the expected jars were found under /opt/(delta-jars|ext-jars). "
+        log.warning("[DVH_UTILS][JAR_CHECK] None of the expected jars were found under /opt/(delta-jars|ext-jars). "
                     "Spark may try Ivy (Maven) if ALLOW_MAVEN=1.")
 
     # Optional online fallback if ALLOW_MAVEN=1
@@ -189,7 +194,7 @@ def get_active_stream_query_by_name(name: str, spark=None, wait_for: float = 0.0
                     return q
         except Exception as e:
             try:
-                log.debug("While scanning active streams for '%s': %s", name, e)
+                log.debug(f"While scanning active streams for '{name}': {e}")
             except Exception:
                 pass
 
@@ -197,7 +202,7 @@ def get_active_stream_query_by_name(name: str, spark=None, wait_for: float = 0.0
             # Optional: one-time debug of what *was* active
             try:
                 active_names = [getattr(q, "name", "<unnamed>") for q in spark.streams.active]
-                log.debug("No stream named '%s' found; active=%s", name, active_names)
+                log.debug(f"No stream named '{name}' found; active={active_names}")
             except Exception:
                 pass
             return None

@@ -21,7 +21,7 @@ def wait_for_kafka(bootstrap, topic, timeout_sec: int = 60):
             producer.close()
 
             if partitions and len(partitions) > 0:
-                log.info(f"[SERVICE_READY][KAFKA] Kafka topic '{topic}' has {len(partitions)} partition(s)")
+                log.info(f"[DVH_UTILS][SERVICE_READY][KAFKA] Kafka topic '{topic}' has {len(partitions)} partition(s)")
                 return
         except Exception as e:
             last_error = e
@@ -54,7 +54,7 @@ def wait_for_lake(timeout_sec: int = 60):
                                 delta_dirs += 1
                     except Exception:
                         pass
-                    log.info(f"[SERVICE_READY][DATA_LAKE] PARQUET_PATH='{PARQUET_PATH}', entries={len(entries)}, delta_tables={delta_dirs}")
+                    log.info(f"[DVH_UTILS][SERVICE_READY][DATA_LAKE] PARQUET_PATH='{PARQUET_PATH}', entries={len(entries)}, delta_tables={delta_dirs}")
                     return
             except Exception as e:
                 last_error = e
@@ -77,7 +77,7 @@ def wait_for_lake(timeout_sec: int = 60):
                 cur.fetchone()
                 cur.close()
                 conn.close()
-                log.info("[SERVICE_READY][DATA_LAKE] RDBMS connection established")
+                log.info("[DVH_UTILS][SERVICE_READY][DATA_LAKE] RDBMS connection established")
                 return
             except Exception as e:
                 last_error = e
@@ -86,7 +86,7 @@ def wait_for_lake(timeout_sec: int = 60):
             f"[SERVICE_NOT_READY][DATA_LAKE] RDBMS lake not ready (host={RDBMS_HOST}, db={RDBMS_DB}): {last_error}"
         )
     else:
-        log.error(f"[SERVICE_NOT_READY][DATA_LAKE] Unknown LAKE_TYPE='{LAKE_TYPE}', continuing without wait")
+        log.error(f"[DVH_UTILS][SERVICE_NOT_READY][DATA_LAKE] Unknown LAKE_TYPE='{LAKE_TYPE}', continuing without wait")
 
 
 
@@ -123,7 +123,7 @@ def wait_for_stream_offset_growth(
     Returns the final observed total on success. Raises TimeoutError on expiry.
     """
     if produced_total <= 0:
-        log.info("[STREAM_OFFSETS] No increase requested (produced_total<=0); nothing to wait for.")
+        log.info("[DVH_UTILS][STREAM_OFFSETS] No increase requested (produced_total<=0); nothing to wait for.")
         return 0
 
     # Helper to sum the total from the query's latest progress snapshot
@@ -140,7 +140,7 @@ def wait_for_stream_offset_growth(
     # Fast-path: already at/over target
     if last_total >= target_total:
         log.info(
-            f"[SERVICE_READY][STREAM_OFFSETS] already observed total={last_total} >= target={target_total}; ready"
+            f"[DVH_UTILS][SERVICE_READY][STREAM_OFFSETS] already observed total={last_total} >= target={target_total}; ready"
         )
         return last_total
 
@@ -156,10 +156,10 @@ def wait_for_stream_offset_growth(
         time.sleep(poll_interval)
         last_total = _latest_total(query)
         log.debug(
-            f"[ASSERT][STREAM_OFFSETS][TICK] base={base_total or 0} produced={produced_total} target={target_total} last_total={last_total}")
+            f"[DVH_UTILS][ASSERT][STREAM_OFFSETS][TICK] base={base_total or 0} produced={produced_total} target={target_total} last_total={last_total}")
         if last_total >= target_total:
             log.info(
-                f"[SERVICE_READY][STREAM_OFFSETS] Observed total={last_total} >= target={target_total}")
+                f"[DVH_UTILS][SERVICE_READY][STREAM_OFFSETS] Observed total={last_total} >= target={target_total}")
             return last_total
 
     # Timed out
@@ -214,9 +214,9 @@ def wait_for_kafka_total_at_least(
     while time.time() - start < timeout_sec:
         per_part = _topic_end_offsets(bootstrap, topic)
         total = sum(per_part.values())
-        log.debug("[ASSERT][KAFKA_OFFSETS][TICK] total=%s per_partition=%s", total, per_part)
+        log.debug(f"[DVH_UTILS][ASSERT][KAFKA_OFFSETS][TICK] total={total} per_partition={per_part}")
         if total >= min_total:
-            log.info("[SERVICE_READY][KAFKA_OFFSETS] '%s' reached total=%s (target=%s)", topic, total, min_total)
+            log.info(f"[DVH_UTILS][SERVICE_READY][KAFKA_OFFSETS] '{topic}' reached total={total} (target={min_total})")
             return total
         time.sleep(1.0)
     raise TimeoutError(
@@ -234,8 +234,7 @@ def wait_for_kafka_increase(
     topic = topic or KAFKA_TOPIC
     if base_total is None:
         base_total = kafka_total_end(bootstrap, topic)
-        log.info("[ASSERT][KAFKA_OFFSETS][BASE] bootstrap=%s topic=%s base_total=%s",
-                 bootstrap, topic, base_total)
+        log.info(f"[DVH_UTILS][ASSERT][KAFKA_OFFSETS][BASE] bootstrap={bootstrap} topic={topic} base_total={base_total}")
     target = base_total + max(min_delta, 0)
     wait_for_kafka_total_at_least(target, timeout_sec, bootstrap, topic)
     return target

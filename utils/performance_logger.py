@@ -1,18 +1,20 @@
+import os
 import threading
 import time
 
 from logger import log
 from pyspark.sql.streaming import StreamingQueryListener
 
-# TODO: find usefull timeinterval for logging, so its not too noisy
 def log_progress_periodically(q, interval=30):
+    try:
+        interval = int(os.getenv("DVH_PROGRESS_LOG_INTERVAL_S", str(interval)))
+    except Exception:
+        interval = interval
     def _loop():
         while q.isActive:
             p = q.lastProgress
             if p:  # None before first batch
-                log.info("[STREAM][last] name=%s batchId=%s numIn=%s irps=%s prps=%s",
-                         p["name"], p["batchId"], p["numInputRows"],
-                         p.get("inputRowsPerSecond"), p.get("processedRowsPerSecond"))
+                log.info(f'[DVH_UTILS][STREAM][last] name={p["name"]} batchId={p["batchId"]} numIn={p["numInputRows"]} irps={p.get("inputRowsPerSecond")} prps={p.get("processedRowsPerSecond")}')
             time.sleep(interval)
 
     threading.Thread(target=_loop, name="progress-logger", daemon=True).start()
@@ -20,7 +22,7 @@ def log_progress_periodically(q, interval=30):
 
 class PerfListener(StreamingQueryListener):
     def onQueryStarted(self, event):
-        log.info(f"[STREAM] started id={event.id} runId={event.runId} name={event.name}")
+        log.info(f"[DVH_UTILS][STREAM] started id={event.id} runId={event.runId} name={event.name}")
 
     def onQueryProgress(self, event):
         p = event.progress
@@ -38,12 +40,9 @@ class PerfListener(StreamingQueryListener):
         trig_ms = int(dur.get("triggerExecution", 0))
         add_ms = int(dur.get("addBatch", 0))
 
-        log.info(
-            "[STREAM][perf] name=%s batchId=%s numIn=%s irps=%.2f prps=%.2f trigMs=%s addMs=%s stateOps=%s",
-            p.name, p.batchId, p.numInputRows, irps, prps, trig_ms, add_ms, len(getattr(p, "stateOperators", []) or []),
-        )
-        log.debug("[STREAM][progress-json] %s", p.json)  # one JSON per batch
+        log.info(f'[DVH_UTILS][STREAM][perf] name={p.name} batchId={p.batchId} numIn={p.numInputRows} irps={irps} prps={prps} trigMs={trig_ms} addMs={add_ms} stateOps={len(getattr(p, "stateOperators", []) or [])}')
+        log.debug(f"[DVH_UTILS][STREAM][progress-json] {p.json}")  # one JSON per batch
 
     def onQueryTerminated(self, event):
-        log.warning(f"[STREAM] terminated id={event.id} runId={event.runId} "
+        log.warning(f"[DVH_UTILS][STREAM] terminated id={event.id} runId={event.runId} "
                     f"exception={getattr(event, 'exception', None)}")

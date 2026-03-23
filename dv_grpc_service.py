@@ -1,3 +1,5 @@
+"""gRPC service that translates SEF operations into vault model changes."""
+
 # vault_grpc_service.py
 
 from __future__ import annotations
@@ -13,6 +15,8 @@ import threading
 import time
 from logger import log
 from config import DBT_MODELS_JSON_DIR, LAKE_TYPE
+from domain.business_keys import infer_business_keys
+from domain.table_identity import physical_table_name as resolve_physical_table_name
 from meta_store import write_metadata
 from proto import sef_handlers_pb2 as pb
 from proto import sef_handlers_pb2_grpc as pb_grpc
@@ -30,25 +34,14 @@ from main import (
 # Small helpers
 # ---------------------------------------------------------------------------
 def _physical_table_name(name: str) -> str:
-    n = (name or "").strip()
-    if not n:
-        return n
-    if "." in n:
-        n = n.split(".", 1)[-1]
-    n = n.strip('"').replace(".", "_").replace("-", "_")
-    return n if LAKE_TYPE == "rdbms" else n.lower()
+    """Resolve the physical storage name for a logical vault table."""
+    return resolve_physical_table_name(name, LAKE_TYPE)
 
 
-def _default_business_keys(table_name: str, models_for_table: List[Dict[str, Any]]) -> List[str]:
-    """
-    Best-effort business key selection.
-    Prefer existing model keys; fallback to ['id'] which matches all E2E datasets.
-    """
-    for m in models_for_table:
-        bks = list(m.get("business_keys") or [])
-        if bks:
-            return bks
-    return ["id"]
+def _default_business_keys(table_name: str, models_for_table: List[Dict[str, Any]], columns: List[str] | None = None) -> List[str]:
+    """Infer business keys from existing models and, when available, observed columns."""
+    return infer_business_keys(table_name, columns or [], models_for_table)
+
 
 def _is_transient_dbt_failure(msg: str) -> bool:
     m = (msg or "").lower()
@@ -181,6 +174,35 @@ def _is_transient_discovery_error(exc: Exception) -> bool:
 # Satellite evolution helpers
 # ---------------------------------------------------------------------------
 
+# Cache to coalesce multi-column ADD_COLUMN operations within the same plan.
+# This prevents creating a new satellite version for every single added column when
+# SEF emits one OPERATION_ADD_COLUMN per column.
+_PLAN_SAT_CACHE: Dict[Tuple[str, str], str] = {}
+_PLAN_SAT_LOCK = threading.Lock()
+_SAT_VERSION_RE = re.compile(r"_v(\d+)$")
+
+
+def _sat_version(model_name: str) -> int:
+    m = _SAT_VERSION_RE.search(str(model_name or ""))
+    if not m:
+        return 0
+    try:
+        return int(m.group(1))
+    except Exception:
+        return 0
+
+
+def _pick_latest_satellite(existing_sats: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not existing_sats:
+        return None
+
+    def _k(s: Dict[str, Any]):
+        name = str(s.get("model_name") or "")
+        attrs = s.get("attributes") or []
+        return (_sat_version(name), len(attrs), name)
+
+    return max(existing_sats, key=_k)
+
 
 def _ensure_satellite_for_table(
     table_name: str,
@@ -230,9 +252,10 @@ def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
     """
     Add an attribute column to the satellite structure for a table.
 
-    Minimal + robust behavior:
-      - Do NOT require lake discovery to build a sat template.
-      - Use existing sat models if present, otherwise create sat_<table>.
+    Key behavior:
+      - Avoid creating one new satellite version per *column* when SEF emits multiple
+        OPERATION_ADD_COLUMN ops in a single plan. Instead, create at most one new
+        satellite per plan+table and extend it in-place for the remaining columns.
       - Queue dbt asynchronously (do not block gRPC).
     """
     params = dict(operation.params)
@@ -262,9 +285,13 @@ def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
     models_for_table = _load_models_for_table(table_name)
     existing_sats = _models_by_type(models_for_table, "sat")
 
-    bks = _default_business_keys(table_name, models_for_table)
+    try:
+        schema_columns = list(_load_table_schema(table_name).columns)
+    except Exception:
+        schema_columns = []
+    bks = _default_business_keys(table_name, models_for_table, schema_columns)
 
-    # If any existing satellite already has this column as attribute -> idempotent no-op
+    # If any existing satellite already has this column as attribute -> idempotent no-op.
     for s in existing_sats:
         if column_name in (s.get("attributes") or []):
             evidence_id = _make_evidence_id(operation)
@@ -284,7 +311,7 @@ def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
                     }
                 )
             except Exception as exc:
-                log.critical(f"[GRPC_SERVICE] Failed to write metadata for ALREADY_APPLIED op: {exc}")
+                log.critical(f'[DVH][GRPC_SERVICE] Failed to write metadata for ALREADY_APPLIED op: {exc}')
 
             return pb.OperationResult(
                 correlation_id=operation.correlation_id,
@@ -296,30 +323,80 @@ def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
                 evidence_snapshot_id=evidence_id,
             )
 
-    # Build a sat template using existing sat (if any) or a new base sat
-    base_attrs: List[str] = []
-    if existing_sats:
-        base_attrs = list(existing_sats[0].get("attributes") or [])
+    plan_id = (operation.plan_id or "").strip()
+    cache_key = (plan_id, table_name)
 
-    # Attributes must not include business keys
-    if column_name not in bks and column_name not in base_attrs:
-        base_attrs.append(column_name)
+    # Choose a per-plan satellite to extend (if one was already created earlier in this plan).
+    sat_name: Optional[str] = None
+    if plan_id:
+        with _PLAN_SAT_LOCK:
+            sat_name = _PLAN_SAT_CACHE.get(cache_key)
 
-    sat_template = {"key": bks, "attributes": base_attrs, "name": f"sat_{table_name}"}
-
-    created_models, _already_present = _ensure_satellite_for_table(table_name, sat_template, models_for_table)
-
-    evidence_id = _make_evidence_id(operation)
+    sat_model: Optional[Dict[str, Any]] = None
+    if sat_name:
+        sat_model = next((s for s in existing_sats if (s.get("model_name") == sat_name)), None)
+        if sat_model is None:
+            sat_name = None
 
     try:
-        if created_models:
+        changed_models: List[str] = []
+
+        if sat_name is None:
+            # First column for this plan+table: create exactly one new satellite version.
+            latest = _pick_latest_satellite(existing_sats)
+            base_attrs = list((latest or {}).get("attributes") or [])
+
+            # Normalize attrs: unique + exclude business keys.
+            attrs: List[str] = []
+            for a in base_attrs:
+                if a not in bks and a not in attrs:
+                    attrs.append(a)
+
+            if column_name not in bks and column_name not in attrs:
+                attrs.append(column_name)
+
+            base_name = f"sat_{table_name}"
+            existing_names = [s.get("model_name") for s in existing_sats if s.get("model_name")]
+            sat_name = _next_versioned_name(base_name, existing_names)
+
+            meta_sat = {"business_keys": bks, "attributes": attrs, "columns": bks + attrs}
+            write_json_model_file(sat_name, table_name, "sat", meta_sat)
+
+            if plan_id:
+                with _PLAN_SAT_LOCK:
+                    _PLAN_SAT_CACHE[cache_key] = sat_name
+
+            changed_models = [sat_name]
+            note = f"created_plan_satellite={sat_name}"
+
+        else:
+            # Subsequent columns in the same plan: extend the already-created plan satellite.
+            attrs_existing = list((sat_model or {}).get("attributes") or [])
+
+            attrs: List[str] = []
+            for a in attrs_existing:
+                if a not in bks and a not in attrs:
+                    attrs.append(a)
+
+            if column_name not in bks and column_name not in attrs:
+                attrs.append(column_name)
+
+            meta_sat = {"business_keys": bks, "attributes": attrs, "columns": bks + attrs}
+            write_json_model_file(sat_name, table_name, "sat", meta_sat)
+
+            changed_models = [sat_name]
+            note = f"extended_plan_satellite={sat_name}"
+
+        evidence_id = _make_evidence_id(operation)
+
+        if changed_models:
             start_dbt_debouncer()
-            queue_dbt_models(created_models)
+            queue_dbt_models(changed_models)
 
         write_metadata(
             {
                 "layer": "vault",
-                "target": sat_template["name"],
+                "target": sat_name or table_name,
                 "plan_id": operation.plan_id,
                 "correlation_id": operation.correlation_id,
                 "idempotency_key": operation.idempotency_key,
@@ -327,16 +404,15 @@ def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
                 "params": params,
                 "evidence_id": evidence_id,
                 "source": "vault_handler_grpc",
-                "note": "created_models=" + ",".join(created_models) if created_models else "no-op",
+                "note": note,
             }
         )
 
-        status = pb.OPERATION_STATUS_OK if created_models else pb.OPERATION_STATUS_ALREADY_APPLIED
         return pb.OperationResult(
             correlation_id=operation.correlation_id,
             plan_id=operation.plan_id,
             idempotency_key=operation.idempotency_key,
-            status=status,
+            status=pb.OPERATION_STATUS_OK,
             error_code="",
             error_message="",
             evidence_snapshot_id=evidence_id,
@@ -344,7 +420,7 @@ def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
 
     except Exception as exc:
         msg = str(exc)
-        log.critical(f"[GRPC_SERVICE] Error applying ADD_COLUMN in vault for table {table_name}: {msg}")
+        log.critical(f'[DVH][GRPC_SERVICE] Error applying ADD_COLUMN in vault for table {table_name}: {msg}')
 
         if _is_transient_dbt_failure(msg):
             status = pb.OPERATION_STATUS_TRANSIENT_ERROR
@@ -360,8 +436,8 @@ def _handle_add_column_for_vault(operation: pb.Operation) -> pb.OperationResult:
             status=status,
             error_code=error_code,
             error_message=msg,
-            evidence_snapshot_id=evidence_id,
         )
+
 
 
 def _handle_new_hub_for_vault(operation: pb.Operation) -> pb.OperationResult:
@@ -392,7 +468,11 @@ def _handle_new_hub_for_vault(operation: pb.Operation) -> pb.OperationResult:
     hub_name = f"hub_{table_name}"
     sat_base_name = f"sat_{table_name}"
 
-    bks = _default_business_keys(table_name, models_for_table)
+    try:
+        schema_columns = list(_load_table_schema(table_name).columns)
+    except Exception:
+        schema_columns = []
+    bks = _default_business_keys(table_name, models_for_table, schema_columns)
 
     created_models: List[str] = []
 
@@ -443,7 +523,7 @@ def _handle_new_hub_for_vault(operation: pb.Operation) -> pb.OperationResult:
 
     except Exception as exc:
         msg = str(exc)
-        log.critical(f"[GRPC_SERVICE] Error applying NEW_HUB in vault for table {table_name}: {msg}")
+        log.critical(f'[DVH][GRPC_SERVICE] Error applying NEW_HUB in vault for table {table_name}: {msg}')
         return pb.OperationResult(
             correlation_id=operation.correlation_id,
             plan_id=operation.plan_id,
@@ -542,11 +622,7 @@ def _handle_new_link_for_vault(operation: pb.Operation) -> pb.OperationResult:
                 break
 
         if found_same:
-            log.info(
-                f"[GRPC_SERVICE] Link with same keyset already exists for table {table_name} (model=%s); "
-                f"no new link created for candidate {base_link_name}",
-                l.get("model_name"),
-            )
+            log.info(f"[DVH][GRPC_SERVICE] Link with same keyset already exists for table {table_name} (model={l.get('model_name'):}); no new link created for candidate {base_link_name}")
             continue
 
         # Create a side-by-side link (either first or a versioned variant)
@@ -559,8 +635,7 @@ def _handle_new_link_for_vault(operation: pb.Operation) -> pb.OperationResult:
         write_json_model_file(link_model_name, table_name, "link", meta_link)
         created_models.append(link_model_name)
         existing_names.append(link_model_name)
-        log.info(
-            f"[GRPC_SERVICE] Created new link model {link_model_name} for table {table_name} with business_keys={keys}")
+        log.info(f'[DVH][GRPC_SERVICE] Created new link model {link_model_name} for table {table_name} with business_keys={keys}')
 
     evidence_id = _make_evidence_id(operation)
 
@@ -588,7 +663,7 @@ def _handle_new_link_for_vault(operation: pb.Operation) -> pb.OperationResult:
         error_message = ""
     except Exception as exc:
         msg = str(exc)
-        log.critical(f"[GRPC_SERVICE] Error applying NEW_LINK in vault for table {table_name}: {exc}")
+        log.critical(f'[DVH][GRPC_SERVICE] Error applying NEW_LINK in vault for table {table_name}: {exc}')
 
         if _is_transient_dbt_failure(msg):
             status = pb.OPERATION_STATUS_TRANSIENT_ERROR
@@ -671,7 +746,7 @@ def _handle_change_type_for_vault(operation: pb.Operation) -> pb.OperationResult
         )
     except Exception as exc:
         msg = f"Vault CHANGE_TYPE failed for {table_name}.{column_name}: {exc}"
-        log.exception("[GRPC_SERVICE] %s", msg)
+        log.exception(f'[DVH][GRPC_SERVICE] {msg:}')
         return pb.OperationResult(
             correlation_id=operation.correlation_id,
             plan_id=operation.plan_id,
@@ -795,7 +870,7 @@ def _handle_drop_column_for_vault(operation: pb.Operation) -> pb.OperationResult
 
     except Exception as exc:
         msg = f"Vault DROP_COLUMN failed for {table_name}.{column_name}: {exc}"
-        log.exception("[GRPC_SERVICE] %s", msg)
+        log.exception(f'[DVH][GRPC_SERVICE] {msg:}')
         return pb.OperationResult(
             correlation_id=operation.correlation_id,
             plan_id=operation.plan_id,
@@ -881,10 +956,7 @@ class VaultHandlerService(pb_grpc.VaultHandlerServicer):
                 kind_name = pb.OperationKind.Name(op.kind)
                 layer_name = pb.Layer.Name(op.layer)
 
-                log.info(
-                    f"[GRPC_SERVICE] VaultHandler.ApplyOperations: plan_id={op.plan_id} correlation_id="
-                    f"{op.correlation_id} layer={layer_name} target={op.target} kind={kind_name} params={dict(op.params)}"
-                )
+                log.info(f'[DVH][GRPC_SERVICE] VaultHandler.ApplyOperations: plan_id={op.plan_id} correlation_id={op.correlation_id} layer={layer_name} target={op.target} kind={kind_name} params={dict(op.params)}')
 
                 try:
                     if op.layer != pb.LAYER_VAULT:
@@ -959,7 +1031,7 @@ class VaultHandlerService(pb_grpc.VaultHandlerServicer):
 
             return pb.OperationBatchResult(results=results)
         except Exception as e:
-            log.exception("[GRPC_SERVICE] ApplyOperations crashed: %s", e)
+            log.exception(f'[DVH][GRPC_SERVICE] ApplyOperations crashed: {e:}')
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return pb.OperationBatchResult(results=[])
@@ -972,9 +1044,7 @@ class VaultHandlerService(pb_grpc.VaultHandlerServicer):
         try:
             table_name = request.dataset_id  # assuming dataset_id == lake table name
             table_name = _physical_table_name(table_name)
-            log.info(
-                f"[GRPC_SERVICE] VaultHandler.IntrospectEvidence: plan_id={request.plan_id} correlation_id="
-                f"{request.correlation_id} dataset_id={table_name}")
+            log.info(f'[DVH][GRPC_SERVICE] VaultHandler.IntrospectEvidence: plan_id={request.plan_id} correlation_id={request.correlation_id} dataset_id={table_name}')
 
             info = _introspect_vault_for_table(table_name)
             vaults = info["vaults"]
@@ -1023,7 +1093,7 @@ class VaultHandlerService(pb_grpc.VaultHandlerServicer):
                 raw_evidence_json=json.dumps(raw),
             )
         except Exception as e:
-            log.exception("[GRPC_SERVICE] IntrospectEvidence crashed: %s", e)
+            log.exception(f'[DVH][GRPC_SERVICE] IntrospectEvidence crashed: {e:}')
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return pb.OperationBatchResult(results=[])
@@ -1036,10 +1106,7 @@ class VaultHandlerService(pb_grpc.VaultHandlerServicer):
         table_name = request.table_name
         fk_filter = request.fk_filter or None
         table_name = _physical_table_name(table_name)
-        log.info(
-            f"[GRPC_SERVICE] VaultHandler.ProbeLinkCandidates: plan_id={request.plan_id} "
-            f"correlation_id={request.correlation_id} table_name={table_name} fk_filter={fk_filter}"
-        )
+        log.info(f'[DVH][GRPC_SERVICE] VaultHandler.ProbeLinkCandidates: plan_id={request.plan_id} correlation_id={request.correlation_id} table_name={table_name} fk_filter={fk_filter}')
 
         if not table_name:
             return pb.LinkProbeResponse(
@@ -1069,7 +1136,7 @@ class VaultHandlerService(pb_grpc.VaultHandlerServicer):
         except Exception as exc:
             # Important: discovery can fail transiently if the lake table isn't created yet.
             msg = f"ProbeLinkCandidates failed for table {table_name!r}: {exc}"
-            log.warning("[GRPC_SERVICE] %s", msg)
+            log.warning(f'[DVH][GRPC_SERVICE] {msg:}')
             return pb.LinkProbeResponse(
                 correlation_id=request.correlation_id,
                 plan_id=request.plan_id,
@@ -1083,17 +1150,18 @@ def serve(stop_event: "threading.Event | None" = None) -> None:
     """
     Start the Vault gRPC server.
 
-    If stop_event is None, this will block with server.wait_for_termination()
-    and can be used as a standalone entrypoint.
-
-    If stop_event is provided, this function will return when the event is set,
-    stopping the server gracefully. This is suitable for running in a
-    background thread from main.py.
+    Critical fix:
+      - Keep a strong reference to the ThreadPoolExecutor for the entire server lifetime.
+        Otherwise the executor can be garbage-collected and shut down, causing:
+          RuntimeError: cannot schedule new futures after shutdown
+        which kills the gRPC server thread and makes DV unavailable (DV_UNAVAILABLE).
     """
     port = int(os.getenv("VAULT_HANDLER_GRPC_PORT", "50052"))
     max_workers = int(os.getenv("VAULT_HANDLER_GRPC_MAX_WORKERS", "10"))
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
+    # KEEP A STRONG REFERENCE (do not inline into grpc.server(...))
+    executor = futures.ThreadPoolExecutor(max_workers=max_workers)
+    server = grpc.server(executor)
     pb_grpc.add_VaultHandlerServicer_to_server(VaultHandlerService(), server)
 
     listen_host = os.getenv("VAULT_GRPC_LISTEN_HOST", "0.0.0.0")
@@ -1108,29 +1176,43 @@ def serve(stop_event: "threading.Event | None" = None) -> None:
             raise RuntimeError(f"Could not bind gRPC server on {listen_addr} or {listen_addr_v6}")
         listen_addr = listen_addr_v6
 
-    log.info("Starting Vault gRPC handler on %s", listen_addr)
+    log.info(f'Starting Vault gRPC handler on {listen_addr:}')
 
     server.start()
     log.info("Vault gRPC handler started; waiting for requests from SEF core.")
 
-    if stop_event is None:
-        # Standalone mode
-        server.wait_for_termination()
-    else:
-        # Cooperative shutdown mode
-        try:
+    try:
+        if stop_event is None:
+            # Standalone mode
+            server.wait_for_termination()
+        else:
+            # Cooperative shutdown mode
             while not stop_event.is_set():
                 time.sleep(0.5)
-        finally:
-            log.info("Vault gRPC stop_event set, stopping server...")
-            # server.stop() returns a Future; wait for termination to avoid executor shutdown races.
+    finally:
+        # Best-effort graceful stop; ensure server is fully down before touching executor.
+        try:
+            log.info("Stopping Vault gRPC server...")
             fut = server.stop(grace=5)
             try:
                 fut.wait(timeout=10)
             except Exception:
-                # best effort
                 pass
+
+            # Some grpc versions provide timeout kw; keep it defensive.
+            try:
+                server.wait_for_termination(timeout=10)
+            except TypeError:
+                # older signature without timeout
+                pass
+
             log.info("Vault gRPC server stopped.")
+        finally:
+            # Only shut down the executor after the server is stopped.
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":
