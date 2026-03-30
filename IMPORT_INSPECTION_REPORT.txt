@@ -1,0 +1,22 @@
+DataVaultHandler import/runtime inspection summary
+
+Package version: v7
+Date: 2026-03-23
+
+Checks performed:
+1. Python compileall over the complete repo.
+2. Full transitive module import sweep with external dependency stubs for logger, grpc, kafka, psycopg2, pyhive, pyarrow, and pyspark.
+3. Targeted validation that dbt schema.yml is generated under repo-root models/.
+4. Targeted validation that dbt-style Jinja env_var(...) profile values are rendered before Hive introspection uses them.
+
+Issues fixed in this package:
+- helper/hive_introspection.py: render schema/database values from profiles.yml before using them in Hive SQL; avoid executing raw Jinja text.
+- helper/hive_schema_helper.py: use shared profile-value rendering and guard against unresolved template text.
+- helper/hive_helper.py: added shared render_profile_value() helper used by thrift/schema resolution.
+- helper/dbt_models_helper.py: generate schema.yml under repo-root models/ rather than helper/models/.
+- helper/dbt_runner.py: resolve schema.yml under repo-root models/.
+- app/entrypoint.py: cooperative gRPC stop/join on exit to avoid shutdown races after startup failures.
+
+Notes:
+- This inspection guarantees the repo's internal import graph is clean under the expected external package names.
+- External package availability/versioning is still determined by the runtime image and requirements installation.

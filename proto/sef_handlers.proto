@@ -1,0 +1,141 @@
+syntax = "proto3";
+
+package sef.handlers.v1;
+
+// Common enums
+
+enum Layer {
+  LAYER_UNSPECIFIED = 0;
+  LAYER_LAKE        = 1;
+  LAYER_VAULT       = 2;
+}
+
+enum OperationKind {
+  OPERATION_KIND_UNSPECIFIED     = 0;
+  OPERATION_ADD_COLUMN           = 1;
+  OPERATION_DROP_COLUMN          = 2;
+  OPERATION_RENAME_COLUMN        = 3;
+  OPERATION_CHANGE_TYPE          = 4;
+  OPERATION_CREATE_COMPAT_VIEW   = 5;
+  OPERATION_DROP_COMPAT_VIEW     = 6;
+  OPERATION_NEW_SATELLITE        = 7;
+  OPERATION_ALTER_SATELLITE      = 8;
+  OPERATION_NEW_HUB              = 9;
+  OPERATION_NEW_LINK             = 10;
+}
+
+enum OperationStatus {
+  OPERATION_STATUS_UNSPECIFIED       = 0;
+  OPERATION_STATUS_OK                = 1;
+  OPERATION_STATUS_ALREADY_APPLIED   = 2;
+  OPERATION_STATUS_TRANSIENT_ERROR   = 3;
+  OPERATION_STATUS_PERMANENT_ERROR   = 4;
+}
+
+// --- Link candidate probe (Vault) ---
+
+message LinkProbeRequest {
+  string correlation_id = 1;
+  string plan_id        = 2;
+  string table_name     = 3;
+  string fk_filter      = 4; // optional
+}
+
+message LinkCandidate {
+  string name = 1;
+  repeated string keys = 2;
+}
+
+message LinkProbeResponse {
+  string correlation_id = 1;
+  string plan_id        = 2;
+  repeated LinkCandidate candidates = 3;
+
+  // Non-empty only if the probe could not run (e.g. lake table not yet present).
+  string error_code     = 4;
+  string error_message  = 5;
+}
+
+// Common structures
+
+message AttributeDescriptor {
+  string name          = 1;
+  string logical_type  = 2;
+  string physical_type = 3;
+  bool   nullable      = 4;
+}
+
+message Operation {
+  string         correlation_id   = 1;
+  string         plan_id          = 2;
+  string         idempotency_key  = 3;
+  Layer          layer            = 4;
+  OperationKind  kind             = 5;
+  string         target           = 6; // dataset/table/satellite identifier
+  map<string,string> params       = 7; // parameters (column_name, new_name, etc.)
+  repeated AttributeDescriptor attributes = 8; // optional, for add/alter ops
+}
+
+message OperationResult {
+  string           correlation_id       = 1;
+  string           plan_id              = 2;
+  string           idempotency_key      = 3;
+  OperationStatus  status               = 4;
+  string           error_code           = 5;
+  string           error_message        = 6;
+  string           evidence_snapshot_id = 7; // key for metadata repository
+  string           evidence_snapshot_uri= 8; // optional URI/path hint
+}
+
+message OperationBatch {
+  repeated Operation operations = 1;
+}
+
+message OperationBatchResult {
+  repeated OperationResult results = 1;
+}
+
+// Verifier introspection
+
+message EvidenceRequest {
+  string correlation_id = 1;
+  string plan_id        = 2;
+  string dataset_id     = 3;
+}
+
+message TableDescriptor {
+  string name = 1;
+  repeated AttributeDescriptor attributes = 2;
+}
+
+message VaultDescriptor {
+  string hub         = 1;
+  repeated string links      = 2;
+  repeated string satellites = 3;
+}
+
+// The handler is free to also persist evidence snapshots separately.
+// raw_evidence_json is for any extra handler-specific structure.
+message EvidenceResponse {
+  string correlation_id = 1;
+  string plan_id        = 2;
+  repeated TableDescriptor tables = 3;
+  repeated VaultDescriptor vault_structures = 4;
+  string raw_evidence_json = 5;
+}
+
+// Lake handler gRPC API
+
+service LakeHandler {
+  rpc ApplyOperations   (OperationBatch)  returns (OperationBatchResult);
+  rpc IntrospectEvidence(EvidenceRequest) returns (EvidenceResponse);
+}
+
+// Vault handler gRPC API
+
+service VaultHandler {
+  rpc ApplyOperations   (OperationBatch)  returns (OperationBatchResult);
+  rpc IntrospectEvidence(EvidenceRequest) returns (EvidenceResponse);
+  rpc ProbeLinkCandidates(LinkProbeRequest) returns (LinkProbeResponse);
+
+}

@@ -1,0 +1,55 @@
+# Python cache/artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Virtual envs
+.venv/
+venv/
+
+# Local tooling & metadata
+.git/
+.gitignore
+.gitattributes
+.pytest_cache/
+.mypy_cache/
+coverage.xml
+.coverage
+.idea/
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Notebooks and large scratch
+*.ipynb
+tmp/
+artifacts/
+dist/
+build/
+
+# Project runtime outputs (don’t ship with image)
+models/
+logs/
+meta/
+metastore_db/
+target/
+data/
+**/*.parquet
+**/*.json
+
+# Compose/K8s overlays (not needed inside the app image)
+docker-compose*.yml
+k8s/
+
+# Keep control folder out if it’s local-only
+control/
+
+
+docker run -d --name dozzle -p 6060:8080 -v /var/run/docker.sock:/var/run/docker.sock amir20/dozzle
+.e2e/
+/models/
+/README.md
